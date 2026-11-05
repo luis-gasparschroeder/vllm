@@ -154,6 +154,40 @@ class ModelState(ABC):
         """
         return AttentionCGSupport.ALWAYS, None
 
+    def prepare_batch(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        *,
+        synthetic: bool = False,
+        skip_attention: bool = False,
+    ) -> None:
+        """Prepare step-owned layouts before slot mapping and attention metadata."""
+        return None
+
+    def prepare_slot_mappings(
+        self,
+        input_batch: InputBatch,
+        tables: BlockTables,
+        block_tables: tuple[torch.Tensor, ...],
+        kv_cache_config: KVCacheConfig,
+    ) -> torch.Tensor:
+        return tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            input_batch.positions,
+            num_tokens_padded=input_batch.num_tokens_after_padding,
+        )
+
+    def slot_mappings_by_layer(
+        self,
+        slot_mappings: torch.Tensor,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, torch.Tensor]:
+        from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+
+        return build_slot_mappings_by_layer(slot_mappings, kv_cache_config)
+
     def preprocess_state(
         self,
         input_batch: InputBatch,

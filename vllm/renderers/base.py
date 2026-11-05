@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Generic, overload
 
 from typing_extensions import TypeVar
 
+from vllm.config.token_gate import TokenGateConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import (
     EmbedsInput,
@@ -1286,6 +1287,28 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return engine_input
 
+    def _validate_token_gate_rendering(
+        self, prompts: Sequence[DictPrompt | bytes], tok_params: TokenizeParams
+    ) -> None:
+        if TokenGateConfig.from_hf_config(self.model_config.hf_text_config) is None:
+            return
+        if tok_params.truncate_prompt_tokens is not None or (
+            tok_params.pad_prompt_tokens is not None
+        ):
+            raise ValueError("TokenGate requires unchanged prompt tokens")
+        for prompt in prompts:
+            if not isinstance(prompt, dict) or "prompt_token_ids" not in prompt:
+                raise ValueError("TokenGate requires pretokenized completion inputs")
+            if any(
+                key in prompt
+                for key in (
+                    "multi_modal_data",
+                    "prompt_embeds",
+                    "encoder_prompt",
+                )
+            ):
+                raise ValueError("TokenGate supports text token IDs only")
+
     # Top-level methods
     def render_cmpl(
         self,
@@ -1300,6 +1323,7 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
 
+        self._validate_token_gate_rendering(prompts, tok_params)
         dict_prompts = self.render_prompts(prompts)
         tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
 
@@ -1325,6 +1349,7 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
 
+        self._validate_token_gate_rendering(prompts, tok_params)
         dict_prompts = await self.render_prompts_async(prompts)
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 
@@ -1350,6 +1375,8 @@ class BaseRenderer(ABC, Generic[_T]):
     ):
         arrival_time = time.time()
 
+        if TokenGateConfig.from_hf_config(self.model_config.hf_text_config) is not None:
+            raise ValueError("TokenGate requires pretokenized Completions, not chat")
         if tok_params is None:
             tok_params = self.default_chat_tok_params
 
@@ -1390,6 +1417,8 @@ class BaseRenderer(ABC, Generic[_T]):
     ):
         arrival_time = time.time()
 
+        if TokenGateConfig.from_hf_config(self.model_config.hf_text_config) is not None:
+            raise ValueError("TokenGate requires pretokenized Completions, not chat")
         if tok_params is None:
             tok_params = self.default_chat_tok_params
 

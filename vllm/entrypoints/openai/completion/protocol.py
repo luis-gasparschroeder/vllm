@@ -38,6 +38,7 @@ from vllm.sampling_params import (
 )
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import is_list_of
+from vllm.utils.token_gate import TOKEN_GATE_FIELDS, validate_token_gate_fields
 
 logger = init_logger(__name__)
 
@@ -47,6 +48,22 @@ _INT64_MAX = 2**63 - 1
 
 
 class CompletionRequest(OpenAIBaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def validate_token_gate_request(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        extra_args = data.get("vllm_xargs")
+        if not isinstance(extra_args, dict):
+            return data
+        validate_token_gate_fields(extra_args)
+        if any(key in extra_args for key in TOKEN_GATE_FIELDS):
+            if data.get("suffix") is not None or data.get("use_beam_search", False):
+                raise ValueError("TokenGate does not support suffixes or beam search")
+            if data.get("prompt_logprob_token_ids") is not None:
+                raise ValueError("TokenGate does not support prompt scoring")
+        return data
+
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str | None = None

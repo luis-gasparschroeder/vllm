@@ -1513,6 +1513,8 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group holds draft layers and takes the EAGLE last-block drop.
     is_eagle_group: bool = False
+    # Logical endpoints are projected through the request's cache layout.
+    uses_compact_sequence: bool = False
     # Host groups use the dedicated HiSparse pool; others share the device pool.
     host_resident: bool = False
     # Whether this group is part of the externally transferable KV state.

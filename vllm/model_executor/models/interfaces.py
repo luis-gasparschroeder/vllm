@@ -73,6 +73,15 @@ if TYPE_CHECKING:
     )
     from vllm.v1.worker.gpu.spec_decode.speculator_config import SpeculatorConfig
 
+
+class DecoderSequenceLayout(Protocol):
+    """Optional token layout shared by a decoder loop and its layers."""
+
+    def positions_for_layer(self, layer_index: int) -> Tensor: ...
+
+    def restore_output(self, hidden_states: Tensor) -> Tensor: ...
+
+
 logger = init_logger(__name__)
 
 MultiModalEmbeddings: TypeAlias = list[Tensor] | Tensor | tuple[Tensor, ...]
@@ -694,8 +703,8 @@ class SupportsKVCacheGrouping(Protocol):
         cls,
         vllm_config: "VllmConfig",
         kv_cache_spec: dict[str, "KVCacheSpec"],
-    ) -> list["KVCacheGroupSpec"]:
-        """Split the model's layers into logical KV cache groups."""
+    ) -> list["KVCacheGroupSpec"] | None:
+        """Split layers into cache groups, or return None for default grouping."""
         ...
 
 

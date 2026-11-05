@@ -1102,7 +1102,7 @@ def _ensure_min_page_size(
         kw: dict[str, Any] = {"block_size": s.block_size * scale}
         if isinstance(s, (AttentionSpec, MambaSpec)) and s.page_size_padded is not None:
             kw["page_size_padded"] = s.page_size_padded * scale
-        scaled.append(KVCacheGroupSpec(g.layer_names, replace(s, **kw)))
+        scaled.append(replace(g, kv_cache_spec=replace(s, **kw)))
     return scaled, common_page
 
 
@@ -1446,6 +1446,7 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group,
+                uses_compact_sequence=group.uses_compact_sequence,
                 host_resident=group.host_resident,
                 enable_kv_transfer=group.enable_kv_transfer,
                 role=group.role,
@@ -1678,17 +1679,18 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
         """
         if not vllm_config.model_config.supports_kv_cache_grouping:
             return get_kv_cache_groups(vllm_config, kv_cache_spec)
-        if vllm_config.attention_config.hisparse_config is not None:
-            raise ValueError(
-                "A model-declared get_kv_cache_groups cannot be combined "
-                "with HiSparse, which owns its own KV cache grouping. "
-                "Remove one of them."
-            )
         model_cls, _ = vllm_config.model_config.registry.resolve_model_cls(
             vllm_config.model_config.architectures,
             vllm_config.model_config,
         )
-        return model_cls.get_kv_cache_groups(vllm_config, kv_cache_spec)
+        groups = model_cls.get_kv_cache_groups(vllm_config, kv_cache_spec)
+        if groups is None:
+            return get_kv_cache_groups(vllm_config, kv_cache_spec)
+        if vllm_config.attention_config.hisparse_config is not None:
+            raise ValueError(
+                "A model-declared get_kv_cache_groups cannot be combined with HiSparse"
+            )
+        return groups
 
     def get_kv_cache_config_from_groups(
         self,

@@ -17,6 +17,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.outputs import RequestError
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_layout import CacheSequenceLayout
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.stats import (
     PrefillStats,
@@ -187,6 +188,7 @@ class EngineCoreRequest(
 
     session_id: str | None = None
     kv_hints: KvHintsEnvelope | None = None
+    cache_sequence_layout: CacheSequenceLayout | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

@@ -2381,6 +2381,15 @@ class VllmConfig:
                     "NCCL_GRAPH_REGISTER=%s pins the CUDA graph pool during sleep.",
                     value,
                 )
+        from vllm.config.token_gate import TokenGateConfig
+
+        if self.model_config is not None:
+            token_gate = TokenGateConfig.from_hf_config(
+                self.model_config.hf_text_config
+            )
+            if token_gate is not None:
+                token_gate.validate_execution(self)
+
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 

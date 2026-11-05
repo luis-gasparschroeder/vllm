@@ -14,6 +14,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.core.kv_cache_layout import CacheSequenceLayout
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -80,6 +81,7 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         kv_hints: KvHintsEnvelope | None = None,
+        cache_sequence_layout: CacheSequenceLayout | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -143,6 +145,7 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        self.cache_sequence_layout = cache_sequence_layout
         self._output_token_ids: list[int] = []
         if self.prompt_token_ids is None:
             self._all_token_ids: list[int] = [0] * self.num_prompt_tokens
@@ -264,6 +267,7 @@ class Request:
             resumable=request.resumable,
             session_id=request.session_id,
             kv_hints=request.kv_hints,
+            cache_sequence_layout=request.cache_sequence_layout,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,

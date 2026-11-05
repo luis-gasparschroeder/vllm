@@ -30,7 +30,9 @@ def resolve_model_state_cls(
 ) -> type[ModelState]:
     # Let the model provide its own ModelState if it defines one.
     if hasattr(model, "get_model_state_cls"):
-        return model.get_model_state_cls()
+        cls = model.get_model_state_cls()
+        if cls is not None:
+            return cls
 
     # Cross-attention encoder-decoder models (Whisper, CohereASR, NemotronParse, ...)
     if any(isinstance(m, CrossAttention) for m in model.modules()):

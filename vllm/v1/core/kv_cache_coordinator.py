@@ -6,6 +6,7 @@ from typing import NamedTuple
 
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_layout import KVCacheTokenCounts
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -202,6 +203,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        group_token_counts: tuple[KVCacheTokenCounts, ...] | None = None,
     ) -> int:
         """Get the number of device blocks needed to be allocated for the request.
 
@@ -223,6 +225,7 @@ class KVCacheCoordinator(ABC):
                 per-request admission cap (SWA / chunked-local). Set only by
                 the full-sequence admission gate; per-step allocation must
                 leave it False so the predictor matches `allocate_new_blocks`.
+            group_token_counts: Optional projected endpoints for each cache group.
             prefill_end: The token index the request's prefill ends at, the
                 same value the scheduler splits chunks against. Under sparse
                 retention Mamba reserves a prefill checkpoint only on the chunk
@@ -233,6 +236,10 @@ class KVCacheCoordinator(ABC):
             The number of blocks to allocate.
 
         """
+        if group_token_counts is not None and len(group_token_counts) != len(
+            self.single_type_managers
+        ):
+            raise ValueError("One token-count record is required per cache group")
         num_blocks_to_allocate = 0
         if self.retention_interval != 0:
             prefill_end = 0
@@ -250,15 +257,28 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
+                counts = (
+                    group_token_counts[i]
+                    if group_token_counts is not None
+                    else KVCacheTokenCounts(
+                        num_tokens,
+                        num_tokens_main_model,
+                        total_computed_tokens,
+                        num_local_computed_tokens,
+                        prefill_end,
+                    )
+                )
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
                     request_id,
-                    num_tokens,
+                    counts.num_tokens,
                     new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_local_computed_tokens,
-                    num_tokens_main_model,
+                    counts.total_computed_tokens,
+                    counts.num_local_computed_tokens,
+                    counts.num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
-                    prefill_end=prefill_end,
+                    prefill_end=counts.prefill_end
+                    if self.retention_interval == 0
+                    else 0,
                 )
         return num_blocks_to_allocate
 
@@ -318,6 +338,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        group_token_counts: tuple[KVCacheTokenCounts, ...] | None = None,
     ) -> tuple[list[KVCacheBlock], ...]:
         """Allocate new blocks for the request to give it at least `num_tokens`
         token slots.
@@ -329,6 +350,7 @@ class KVCacheCoordinator(ABC):
             num_tokens_main_model: The number of tokens for the main model (aka target
                 model in spec decode). w/o spec decode, it is num_tokens;
                 with spec decode, it is num_tokens - num_lookahead_tokens.
+            group_token_counts: Optional projected endpoints for each cache group.
             num_encoder_tokens: The number of encoder tokens for allocating
                 blocks for cross-attention.
 
@@ -336,15 +358,25 @@ class KVCacheCoordinator(ABC):
             The new allocated blocks.
 
         """
+        if group_token_counts is not None and len(group_token_counts) != len(
+            self.single_type_managers
+        ):
+            raise ValueError("One token-count record is required per cache group")
         return tuple(
             manager.allocate_new_blocks(
                 request_id,
                 num_encoder_tokens
                 if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-                num_tokens_main_model,
+                else (
+                    group_token_counts[i].num_tokens
+                    if group_token_counts is not None
+                    else num_tokens
+                ),
+                group_token_counts[i].num_tokens_main_model
+                if group_token_counts is not None
+                else num_tokens_main_model,
             )
-            for manager in self.single_type_managers
+            for i, manager in enumerate(self.single_type_managers)
         )
 
     def get_num_cacheable_tokens(

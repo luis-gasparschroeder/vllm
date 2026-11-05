@@ -99,7 +99,6 @@ from vllm.v1.worker.gpu.async_utils import (
 )
 from vllm.v1.worker.gpu.attn_utils import (
     FastPrefillHelper,
-    build_slot_mappings_by_layer,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
@@ -1635,11 +1634,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
-        slot_mappings = self.block_tables.compute_slot_mappings(
-            input_batch.idx_mapping,
-            input_batch.query_start_loc,
-            input_batch.positions,
-            num_tokens_padded=input_batch.num_tokens_after_padding,
+        slot_mappings = self.model_state.prepare_slot_mappings(
+            input_batch,
+            self.block_tables,
+            block_tables,
+            self.kv_cache_config,
         )
         return block_tables, slot_mappings
 
@@ -1889,6 +1888,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
+            self.model_state.prepare_batch(input_batch, self.req_states)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -1929,6 +1929,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch = self.pcp_manager.prepare_inputs_for_capture_or_profile(
                     input_batch
                 )
+            self.model_state.prepare_batch(
+                input_batch,
+                self.req_states,
+                synthetic=True,
+                skip_attention=skip_attn_for_dummy_run,
+            )
             if skip_attn_for_dummy_run:
                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
                     "Attention metadata must be prepared for dummy runs when using "
@@ -1979,7 +1985,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         elif not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
-            slot_mappings_by_layer = build_slot_mappings_by_layer(
+            slot_mappings_by_layer = self.model_state.slot_mappings_by_layer(
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None

@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_layout import KVCacheTokenCounts, compute_group_token_counts
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
@@ -541,6 +542,16 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
+                group_token_counts=self._group_token_counts(
+                    request,
+                    KVCacheTokenCounts(
+                        full_num_tokens,
+                        full_num_tokens,
+                        total_computed_tokens,
+                        num_local_computed_tokens,
+                        prefill_end,
+                    ),
+                ),
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
@@ -576,6 +587,16 @@ class KVCacheManager:
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
+            group_token_counts=self._group_token_counts(
+                request,
+                KVCacheTokenCounts(
+                    num_tokens_need_slot,
+                    num_tokens_main_model,
+                    num_local_computed_tokens + num_external_computed_tokens,
+                    num_local_computed_tokens,
+                    prefill_end,
+                ),
+            ),
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
@@ -605,6 +626,13 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            group_token_counts=self._group_token_counts(
+                request,
+                KVCacheTokenCounts(
+                    num_tokens_need_slot,
+                    num_tokens_main_model,
+                ),
+            ),
         )
 
         # P/D: delay caching blocks if we have to recv from
@@ -624,6 +652,18 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _group_token_counts(
+        self, request: Request, counts: KVCacheTokenCounts
+    ) -> tuple[KVCacheTokenCounts, ...] | None:
+        groups = self.coordinator.kv_cache_config.kv_cache_groups
+        if not any(group.uses_compact_sequence for group in groups):
+            return None
+        return compute_group_token_counts(
+            counts,
+            request.cache_sequence_layout,
+            tuple(group.uses_compact_sequence for group in groups),
+        )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

@@ -1,5 +1,7 @@
 # Features
 
+- [TokenGate](token_gate.md): learned token pruning for dense Qwen3 and text-only Qwen3.5.
+
 ## KV Cache Offloading
 
 - [UMBPStoreConnector](umbp_store_connector_usage.md)

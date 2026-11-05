@@ -25,6 +25,7 @@
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
+from dataclasses import replace
 from itertools import islice
 from typing import ClassVar, cast
 
@@ -38,6 +39,7 @@ from transformers import (
 )
 
 from vllm.config import MultiModalConfig, VllmConfig
+from vllm.config.token_gate import TokenGateConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -73,17 +75,20 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
+from vllm.model_executor.layers.token_gate import TokenGate, TokenGateBatch
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    DecoderSequenceLayout,
     EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsEagle3,
+    SupportsKVCacheGrouping,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -124,6 +129,15 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.v1.attention.backends.token_gate import TokenGateAttentionBackend
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from .ops.fused_gdn_gated_norm import fused_gdn_gated_rms_norm
 from .ops.fused_norm_quant import FP8_DTYPE, gemma_add_rms_norm_quant
@@ -247,6 +261,19 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        token_gate_config = TokenGateConfig.from_hf_config(config)
+        self.token_gate = None
+        if (
+            token_gate_config is not None
+            and self.layer_idx == token_gate_config.gate_layer
+        ):
+            self.token_gate = TokenGate(
+                config.hidden_size,
+                config.intermediate_size,
+                len(token_gate_config.attention_layer_indices),
+                config.num_attention_heads,
+                token_gate_config.normalization_epsilon,
+            )
         is_moe_layer = config.model_type == "qwen3_5_moe_text"
         self.use_attn_reduce_scatter_for_moe = (
             parallel_config.use_sequence_parallel_moe
@@ -290,6 +317,12 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 reduce_results=reduce_results,
                 mrope_positions_factor=mrope_positions_factor(vllm_config),
+                attn_backend=(
+                    TokenGateAttentionBackend
+                    if token_gate_config is not None
+                    and self.layer_idx in token_gate_config.attention_layer_indices
+                    else None
+                ),
             )
             self.self_attn.use_fused_output_gate = True
         else:
@@ -360,6 +393,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor,
+        sequence_layout: object = None,
         **kwargs: object,
     ):
         if self.use_attn_reduce_scatter_for_moe:
@@ -421,6 +455,12 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
+            )
+        if self.token_gate is not None:
+            if not isinstance(sequence_layout, TokenGateBatch):
+                raise ValueError("TokenGate requires a runner-owned sequence layout")
+            hidden_states, residual = self.token_gate.compact(
+                hidden_states, residual, sequence_layout
             )
         hidden_states = self.mlp(hidden_states)
 
@@ -538,6 +578,7 @@ class Qwen3_5Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        sequence_layout: DecoderSequenceLayout | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -560,11 +601,19 @@ class Qwen3_5Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+            if sequence_layout is None:
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+            else:
+                hidden_states, residual = layer(
+                    positions=sequence_layout.positions_for_layer(layer_idx),
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    sequence_layout=sequence_layout,
+                )
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
@@ -593,6 +642,8 @@ class Qwen3_5Model(nn.Module, EagleModelMixin):
             else:
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
                 hidden_states = hidden_states[:full_num_tokens]
+        if sequence_layout is not None:
+            hidden_states = sequence_layout.restore_output(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -610,6 +661,7 @@ class Qwen3_5ForCausalLMBase(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsKVCacheGrouping,
 ):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -684,10 +736,15 @@ class Qwen3_5ForCausalLMBase(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        sequence_layout: TokenGateBatch | None = None,
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            sequence_layout=sequence_layout,
         )
 
         return hidden_states
@@ -743,9 +800,95 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
+    def get_model_state_cls(self):
+        if TokenGateConfig.from_hf_config(self.config) is None:
+            return None
+        from vllm.v1.worker.gpu.model_states.token_gate_hybrid import (
+            TokenGateHybridModelState,
+        )
+
+        return TokenGateHybridModelState
+
+    @classmethod
+    def get_kv_cache_groups(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: dict[str, KVCacheSpec],
+    ) -> list[KVCacheGroupSpec] | None:
+        """Separate cache groups for full and TokenGate-retained sequences.
+
+        Layers sharing a cache block table must follow the same token history.
+        Use the standard hybrid planner to align attention and recurrent-state
+        pages, then split each group at the gate. Layers through the gate follow
+        the full sequence; later layers follow the retained sequence. Both include
+        generated tokens. The gate layer follows the full sequence because its
+        mixer runs before pruning.
+
+        Args:
+            vllm_config: Engine configuration containing the TokenGate gate layer
+                and the settings used by the standard cache planner.
+            kv_cache_spec: Layer names mapped to their full-attention or
+                recurrent-state cache specifications.
+
+        Returns:
+            Cache groups preserving the planner's cache types and page alignment,
+            with uses_compact_sequence set for layers after the gate and external
+            KV transfer disabled. Returns None when TokenGate is absent, allowing
+            vLLM to use its default grouping.
+
+        Raises:
+            ValueError: TokenGate is enabled and a layer's cache specification
+                is neither FullAttentionSpec nor MambaSpec.
+
+        """
+        config = TokenGateConfig.from_hf_config(vllm_config.model_config.hf_text_config)
+        if config is None:
+            return None
+        if any(
+            type(spec) not in (FullAttentionSpec, MambaSpec)
+            for spec in kv_cache_spec.values()
+        ):
+            raise ValueError("TokenGate requires full-attention and recurrent caches")
+        groups = []
+        # Plan page alignment across the model before separating logical histories.
+        for group in get_kv_cache_groups(vllm_config, kv_cache_spec):
+            for compact in (False, True):
+                names = [
+                    name
+                    for name in group.layer_names
+                    if (extract_layer_index(name) > config.gate_layer) == compact
+                ]
+                if not names:
+                    continue
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = replace(
+                        spec,
+                        kv_cache_specs={
+                            name: spec.kv_cache_specs[name] for name in names
+                        },
+                    )
+                groups.append(
+                    replace(
+                        group,
+                        layer_names=names,
+                        kv_cache_spec=spec,
+                        uses_compact_sequence=compact,
+                        enable_kv_transfer=False,
+                    )
+                )
+        return groups
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if TokenGateConfig.from_hf_config(self.config) is not None:
+            required = {
+                name for name, _ in self.named_parameters() if ".token_gate." in name
+            }
+            if missing := required - loaded:
+                raise ValueError(f"Missing TokenGate weights: {sorted(missing)}")
+        return loaded
 
     def get_mrope_input_positions(
         self,

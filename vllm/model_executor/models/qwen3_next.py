@@ -66,7 +66,7 @@ from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionType
 
 from .interfaces import (
     EagleModelMixin,
@@ -295,6 +295,7 @@ class Qwen3NextAttention(nn.Module):
         reduce_results: bool = True,
         prefix: str = "",
         mrope_positions_factor: int = 4,
+        attn_backend: type[AttentionBackend] | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -367,6 +368,7 @@ class Qwen3NextAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
+            attn_backend=attn_backend,
             **{
                 "layer_idx": extract_layer_index(prefix),
                 "dual_chunk_attention_config": self.dual_chunk_attention_config,

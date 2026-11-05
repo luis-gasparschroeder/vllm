@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.token_gate import TokenGateConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import (
     EngineInput,
@@ -32,6 +33,13 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.utils.jsontree import json_iter_leaves
+from vllm.utils.token_gate import (
+    TOKEN_GATE_FIELDS,
+    TokenGateRequestOptions,
+    validate_token_gate_sampling,
+    validate_token_gate_transformations,
+)
+from vllm.v1.core.kv_cache_layout import CacheSequenceLayout
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
 
@@ -395,6 +403,25 @@ class InputProcessor:
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> EngineCoreRequest:
+        token_gate = TokenGateConfig.from_hf_config(self.model_config.hf_text_config)
+        if isinstance(params, SamplingParams):
+            extra_args = params.extra_args or {}
+            has_token_gate = any(key in extra_args for key in TOKEN_GATE_FIELDS)
+            if has_token_gate and token_gate is None:
+                raise ValueError("TokenGate metadata requires a TokenGate checkpoint")
+            if token_gate is not None:
+                validate_token_gate_sampling(params)
+                validate_token_gate_transformations(
+                    extra_args, tokenization_kwargs=tokenization_kwargs
+                )
+                if resumable or lora_request is not None:
+                    raise ValueError(
+                        "TokenGate does not support streaming input or LoRA"
+                    )
+                if not isinstance(prompt, dict) or "prompt_token_ids" not in prompt:
+                    raise ValueError(
+                        "TokenGate requires pretokenized completion inputs"
+                    )
         watermarking = self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
 
@@ -450,6 +477,23 @@ class InputProcessor:
             prompt_token_ids = decoder_input["prompt_token_ids"]
             prompt_embeds = None
             prompt_is_token_ids = None
+
+        cache_sequence_layout = None
+        if token_gate is not None:
+            if (
+                not isinstance(params, SamplingParams)
+                or prompt_token_ids is None
+                or prompt_embeds is not None
+                or encoder_input is not None
+                or decoder_input["type"] != "token"
+            ):
+                raise ValueError("TokenGate supports text token IDs only")
+            options = TokenGateRequestOptions.parse(
+                params.extra_args, len(prompt_token_ids)
+            )
+            cache_sequence_layout = CacheSequenceLayout(
+                len(prompt_token_ids), len(prompt_token_ids) - options.removed_tokens
+            )
 
         sampling_params = None
         pooling_params = None
@@ -568,6 +612,7 @@ class InputProcessor:
             resumable=resumable,
             session_id=session_id,
             kv_hints=kv_hints,
+            cache_sequence_layout=cache_sequence_layout,
         )
 
     def _validate_prompt_len(

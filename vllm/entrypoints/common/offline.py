@@ -32,6 +32,11 @@ from vllm.renderers.inputs.preprocess import (
 from vllm.sampling_params import RequestOutputKind
 from vllm.utils.counter import Counter
 from vllm.utils.mistral import is_mistral_tokenizer
+from vllm.utils.token_gate import (
+    TOKEN_GATE_FIELDS,
+    validate_token_gate_sampling,
+    validate_token_gate_transformations,
+)
 from vllm.utils.tqdm_utils import maybe_tqdm
 from vllm.v1.engine.llm_engine import LLMEngine
 
@@ -316,6 +321,16 @@ class OfflineInferenceMixin:
     ) -> list[str]:
         seq_prompts = prompt_to_seq(prompts)
         seq_params = self._params_to_seq(params, len(seq_prompts))
+        for sampling in seq_params:
+            if (
+                isinstance(sampling, SamplingParams)
+                and sampling.extra_args
+                and any(key in sampling.extra_args for key in TOKEN_GATE_FIELDS)
+            ):
+                validate_token_gate_sampling(sampling)
+                validate_token_gate_transformations(
+                    sampling.extra_args, tokenization_kwargs=tokenization_kwargs
+                )
         seq_lora_requests = self._lora_request_to_seq(lora_request, len(seq_prompts))
         seq_priority = self._priority_to_seq(priority, len(seq_prompts))
 

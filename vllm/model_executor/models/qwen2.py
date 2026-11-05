@@ -59,6 +59,7 @@ from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import (
+    DecoderSequenceLayout,
     EagleModelMixin,
     SupportsEagle,
     SupportsEagle3,
@@ -405,6 +406,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        sequence_layout: DecoderSequenceLayout | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -428,7 +430,15 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            if sequence_layout is None:
+                hidden_states, residual = layer(positions, hidden_states, residual)
+            else:
+                hidden_states, residual = layer(
+                    sequence_layout.positions_for_layer(idx),
+                    hidden_states,
+                    residual,
+                    sequence_layout=sequence_layout,
+                )
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
@@ -443,6 +453,8 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if sequence_layout is not None:
+            hidden_states = sequence_layout.restore_output(hidden_states)
 
         aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:

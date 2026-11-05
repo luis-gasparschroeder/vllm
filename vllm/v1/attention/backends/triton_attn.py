@@ -91,6 +91,7 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    key_bias: torch.Tensor | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -696,6 +697,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         unified_attention(
             q=query[:num_actual_tokens],
+            key_bias=attn_metadata.key_bias,
             k=key_cache,
             v=value_cache,
             out=output[:num_actual_tokens],

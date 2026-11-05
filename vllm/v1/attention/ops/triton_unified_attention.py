@@ -192,6 +192,12 @@ def kernel_unified_attention(
     seq_lens_ptr,
     alibi_slopes_ptr,
     qq_bias_ptr,
+    key_bias_ptr,
+    key_bias_length,
+    key_bias_stride_seq: tl.int64,
+    key_bias_stride_token: tl.int64,
+    key_bias_stride_head: tl.int64,
+    USE_KEY_BIAS: tl.constexpr,
     # Scalars
     scale,
     q_scale,
@@ -565,6 +571,18 @@ def kernel_unified_attention(
                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
             )
 
+        if USE_KEY_BIAS:
+            bias_offset = (
+                seq_idx.to(tl.int64) * key_bias_stride_seq
+                + seq_offset[None, :].to(tl.int64) * key_bias_stride_token
+                + query_offset_1[:, None].to(tl.int64) * key_bias_stride_head
+            )
+            S += tl.load(
+                key_bias_ptr + bias_offset,
+                mask=(seq_offset[None, :] < key_bias_length) & query_mask_1[:, None],
+                other=0.0,
+            ).to(tl.float32)
+
         M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[:, None]
 
@@ -873,7 +891,19 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    # Logical cached-key bias [requests, biased prefix length, query heads].
+    # Keys beyond this prefix have zero bias, including newly generated keys.
+    key_bias: torch.Tensor | None = None,
 ):
+    if key_bias is not None:
+        if kv_quant_mode != KVQuantMode.NONE:
+            raise ValueError("Cached-key bias requires unquantized KV")
+        if (
+            key_bias.ndim != 3
+            or key_bias.shape[0] != seqused_k.numel()
+            or key_bias.shape[2] != q.shape[1]
+        ):
+            raise ValueError("key_bias must have shape [requests, prefix, query heads]")
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
@@ -1141,6 +1171,12 @@ def unified_attention(
         seq_lens_ptr=seqused_k,
         alibi_slopes_ptr=alibi_slopes,
         qq_bias_ptr=qq_bias,
+        key_bias_ptr=key_bias,
+        key_bias_length=key_bias.shape[1] if key_bias is not None else 0,
+        key_bias_stride_seq=key_bias.stride(0) if key_bias is not None else 0,
+        key_bias_stride_token=key_bias.stride(1) if key_bias is not None else 0,
+        key_bias_stride_head=key_bias.stride(2) if key_bias is not None else 0,
+        USE_KEY_BIAS=key_bias is not None,
         k_scale_cache_ptr=k_scale_ptr,
         v_scale_cache_ptr=v_scale_ptr,
         scale=softmax_scale,

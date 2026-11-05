@@ -32,6 +32,7 @@ from transformers import Qwen3Config
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.token_gate import TokenGateConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.encoder_only_attention import (
@@ -43,10 +44,12 @@ from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLine
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.token_gate import TokenGate, TokenGateBatch
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, KVCacheSpec
 
 from .interfaces import (
     LocalArgmaxMixin,
@@ -80,6 +83,7 @@ class Qwen3Attention(nn.Module):
         dual_chunk_attention_config: dict[str, Any] | None = None,
         per_layer_sliding_window: int | None = None,
         mrope_positions_factor: int = 4,
+        token_gate_attention: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -138,6 +142,10 @@ class Qwen3Attention(nn.Module):
                 "layer_idx": extract_layer_index(prefix),
                 "dual_chunk_attention_config": dual_chunk_attention_config,
             }
+        if token_gate_attention:
+            from vllm.v1.attention.backends.token_gate import TokenGateAttentionBackend
+
+            attention_kwargs["attn_backend"] = TokenGateAttentionBackend
         self.attn = attn_cls(
             self.num_heads,
             self.head_dim,
@@ -185,6 +193,20 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        token_gate_config = TokenGateConfig.from_hf_config(config)
+        layer_index = extract_layer_index(prefix)
+        self.token_gate = None
+        if (
+            token_gate_config is not None
+            and layer_index == token_gate_config.gate_layer
+        ):
+            self.token_gate = TokenGate(
+                config.hidden_size,
+                config.intermediate_size,
+                len(token_gate_config.attention_layer_indices),
+                config.num_attention_heads,
+                token_gate_config.normalization_epsilon,
+            )
         set_default_rope_theta(config, default_theta=1000000)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
@@ -215,6 +237,10 @@ class Qwen3DecoderLayer(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
             per_layer_sliding_window=per_layer_sliding_window,
             mrope_positions_factor=mrope_positions_factor,
+            token_gate_attention=(
+                token_gate_config is not None
+                and layer_index > token_gate_config.gate_layer
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -233,6 +259,7 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        sequence_layout: TokenGateBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -247,6 +274,12 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.token_gate is not None:
+            if sequence_layout is None:
+                raise ValueError("TokenGate requires a prepared sequence layout")
+            hidden_states, residual = self.token_gate.compact(
+                hidden_states, residual, sequence_layout
+            )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -330,9 +363,14 @@ class Qwen3ForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        sequence_layout: TokenGateBatch | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            sequence_layout=sequence_layout,
         )
         return hidden_states
 
@@ -349,6 +387,43 @@ class Qwen3ForCausalLM(
     ) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
+    def get_model_state_cls(self):
+        if TokenGateConfig.from_hf_config(self.config) is None:
+            return None
+        from vllm.v1.worker.gpu.model_states.token_gate import TokenGateModelState
+
+        return TokenGateModelState
+
+    @classmethod
+    def get_kv_cache_groups(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: dict[str, KVCacheSpec],
+    ) -> list[KVCacheGroupSpec] | None:
+        config = TokenGateConfig.from_hf_config(vllm_config.model_config.hf_text_config)
+        if config is None:
+            return None
+        groups = []
+        for name, spec in sorted(kv_cache_spec.items()):
+            if type(spec) is not FullAttentionSpec:
+                raise ValueError("TokenGate requires full-attention cache groups")
+            groups.append(
+                KVCacheGroupSpec(
+                    layer_names=[name],
+                    kv_cache_spec=spec,
+                    uses_compact_sequence=extract_layer_index(name) > config.gate_layer,
+                    enable_kv_transfer=False,
+                )
+            )
+        return groups
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        if TokenGateConfig.from_hf_config(self.config) is not None:
+            required = {
+                name for name, _ in self.named_parameters() if ".token_gate." in name
+            }
+            if missing := required - loaded:
+                raise ValueError(f"Missing TokenGate weights: {sorted(missing)}")
+        return loaded
