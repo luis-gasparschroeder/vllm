@@ -70,10 +70,8 @@ class TokenGateConfig:
         if not isinstance(data, dict):
             raise ValueError("token_gate must be a versioned configuration object")
         version = data.get("format_version")
-        if type(version) is not int or version not in (1, 2):
+        if type(version) is not int or version != 2:
             raise ValueError("Unsupported TokenGate format_version")
-        if version == 1 and config.model_type != "qwen3":
-            raise ValueError("TokenGate format_version 1 supports Qwen3 only")
         required = {
             "attention_semantics": "tokengate_code_v1",
             "precision": "bfloat16",
@@ -89,16 +87,13 @@ class TokenGateConfig:
         if not isinstance(layer, int) or isinstance(layer, bool):
             raise ValueError("TokenGate requires an integer gate_layer")
         indices = attention_layer_indices(config, layer)
-        if version == 2:
-            declared = data.get("attention_layer_indices")
-            if (
-                not isinstance(declared, list)
-                or any(type(index) is not int for index in declared)
-                or tuple(declared) != indices
-            ):
-                raise ValueError(
-                    "TokenGate attention_layer_indices disagree with topology"
-                )
+        declared = data.get("attention_layer_indices")
+        if (
+            not isinstance(declared, list)
+            or any(type(index) is not int for index in declared)
+            or tuple(declared) != indices
+        ):
+            raise ValueError("TokenGate attention_layer_indices disagree with topology")
         provenance = data.get("provenance")
         if not isinstance(provenance, dict) or not all(
             provenance.get(key)
@@ -107,13 +102,9 @@ class TokenGateConfig:
                 "gate_sha256",
                 "adapter_sha256",
                 "tokenizer_sha256",
-                "reference_revision",
-                "selection_policy",
             )
         ):
-            raise ValueError(
-                "TokenGate export lacks verified artifact/policy provenance"
-            )
+            raise ValueError("TokenGate export lacks source artifact hashes")
         return cls(layer, indices)
 
     def validate_execution(self, config: Any) -> None:

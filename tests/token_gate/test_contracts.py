@@ -140,8 +140,8 @@ def test_scorer_matches_expanded_qwen_normalization(length, keep):
     ) * (hidden @ gate.input_up.weight.to(hidden.dtype).T)
     raw = branch @ gate.output.weight.to(hidden.dtype).T
     norm = Qwen3RMSNorm(1, eps=1e-6)
-    # Research prefill_batch_for_decode casts gate_branch_hs to gate_param.dtype
-    # (FP32) before E2EGate.forward expands scores and applies Qwen3RMSNorm.
+    # The original TokenGate implementation normalizes gate scores in FP32.
+    # Expand them across heads as E2EGate.forward does before Qwen3RMSNorm.
     expanded = raw.float()[:, None].expand(-1, 2, 4).movedim(0, -1)
     expected = norm(expanded).movedim(-1, 0)[:, 0, 0]
     torch.testing.assert_close(gate.score(hidden), expected, rtol=0, atol=0)
@@ -229,13 +229,15 @@ def test_replayed_generated_queries_use_decode_cast_order():
         ("decode_phase2_form", False),
         ("prune_below_gate", True),
         ("format_version", True),
+        ("format_version", 1),
         ("attention_semantics", "paper"),
     ],
 )
 def test_checkpoint_semantics_fail_closed(key, value):
     config = Qwen3Config(num_hidden_layers=3)
     config.token_gate = {
-        "format_version": 1,
+        "format_version": 2,
+        "attention_layer_indices": [1, 2],
         "gate_layer": 0,
         "selection_mode": "topk",
         "random_topk": False,
@@ -249,8 +251,6 @@ def test_checkpoint_semantics_fail_closed(key, value):
                 "gate_sha256",
                 "adapter_sha256",
                 "tokenizer_sha256",
-                "reference_revision",
-                "selection_policy",
             ),
             "test-evidence",
         ),

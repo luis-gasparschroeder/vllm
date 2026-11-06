@@ -37,7 +37,7 @@ positions and restores output rows. No separate TokenGate model class is needed.
 ## Scores and token-gated attention
 
 The checkpoint declares `attention_semantics="tokengate_code_v1"`. This names
-the research-code computation, including its floating-point cast order.
+the original TokenGate computation, including its floating-point cast order.
 
 The scoring MLP computes in BF16. Its scalar outputs are converted to FP32 and
 RMS-normalized over the prunable span. Normalized scores and ranking remain in
@@ -67,7 +67,7 @@ r_i=\min\left(1,\frac{\log\max(m_i,2)}{\log\max(p_i+1,2)}\right),
 \qquad \tau_{i\ell h}=S_{\ell h}r_i.
 $$
 
-The research code applies query scaling and a key-score bias. Before causal
+The original TokenGate implementation applies query scaling and a key-score bias. Before causal
 softmax, its logits are:
 
 $$
@@ -195,45 +195,35 @@ initialized during fresh prefill or replay, then continued during decode.
 
 ## Checkpoint format
 
-The [export command](../features/token_gate.md#export-trained-weights) accepts
-matched gate, adapter, and training-parameter files. Its evidence JSON uses
-these fields:
+The [export command](../features/token_gate.md#export-trained-weights) reads
+the TokenGate repository's gate and name-paired adapter files. The gate
+contains architecture settings and metadata describing the base model, gate
+layer, training step, and adapter targets. Missing selection settings use the
+original loader's defaults (`topk`, `random_topk=False`); explicit unsupported
+settings are rejected.
 
-| Fields | Required contents |
-| --- | --- |
-| `format_version` | Integer `1`, the evidence-manifest version. |
-| `selection_mode`, `random_topk` | `"topk"` and `false`. Training parameters must also explicitly declare these policies. |
-| `gate_step`, `adapter_step` | Matching integers consistent with the gate's recorded training step. |
-| `base_model`, `reference_revision`, `run_id` | Nonempty strings identifying the base, research-code revision, and training run. |
-| `gate_sha256`, `adapter_sha256`, `params_sha256` | SHA-256 hashes of the three input artifacts. |
-| `tokenizer_sha256`, `base_config_sha256` | Tokenizer fingerprint and hash of the base `config.json`. |
-| `base_weight_sha256` | Mapping from every base safetensors filename to its SHA-256 hash. |
-
-Use `artifact_sha256()` and `tokenizer_sha256()` from
-`tools/export_token_gate.py` in the source checkout to calculate the hashes. Pairing and policy
-declarations must come from verified training records. Hashes bind declarations
-to files; they cannot prove a declaration true. An adjacent `params.json` alone
-does not establish pairing. Older gate files that omit policy fields still
-need evidence. Research checkpoint saves preserve policy and provenance for
-intermediate, final, and averaged weights.
+The exporter records hashes of the input weights, configuration, and tokenizer
+in `config.json`, and writes `token_gate_export_manifest.json` with hashes of
+the output files. Benchmark records separately identify pinned Hub revisions
+and source code. These records identify files; they do not establish numerical
+equivalence or independently verify how the checkpoint was trained.
 
 The exporter checks tensor completeness, dimensions, policies, training steps,
 and finite merged values. It rejects unknown tensors, unsupported gate
 variants, threshold or random selection, nonfinite scales, and BF16 merge
-overflow. It resolves omitted adapter targets to research defaults; delta
+overflow. It resolves omitted adapter targets to TokenGate loader defaults; delta
 adapters cover all four attention and all three MLP projections in each declared
 layer. Qwen3.5 adapters must explicitly list full-attention layer IDs and cannot
 target recurrent layers.
 
-Serving metadata uses **version 2**, including `attention_layer_indices`.
-Qwen3 **version 1** exports remain readable. These versions are independent of
-the **version 1** evidence manifest and request fields. Qwen3.5 exports use
+Serving metadata includes an explicit `attention_layer_indices` list for both
+Qwen3 and Qwen3.5. Qwen3.5 exports use
 `Qwen3_5ForCausalLM` and preserve partial RoPE, the native attention output gate,
 tied embeddings, and the configured recurrent-state dtype.
 
 ## Validation
 
-The tests cover request validation, export evidence, adapter merging, score
+The tests cover request validation, checkpoint pairing, adapter merging, score
 casts, selection, residual gathering, output restoration, cache allocation,
 paged attention, public generation, request queues, and slot reuse. CUDA tests
 use small real Hugging Face checkpoints, independent dense attention, and the
@@ -241,9 +231,9 @@ Hugging Face recurrent implementation.
 
 Validate a trained checkpoint in two stages:
 
-1. Compare the original research model with its merged-weight export to isolate
+1. Compare the original TokenGate model with its merged-weight export to isolate
    adapter-merging effects.
-2. Compare that same export in research execution and vLLM. Check scores on
+2. Compare that same export in the original TokenGate implementation and vLLM. Check scores on
    identical gate inputs, retained indices, logits or logprobs on a shared
    generated history, and complete answers.
 

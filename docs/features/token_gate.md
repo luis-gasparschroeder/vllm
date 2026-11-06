@@ -47,11 +47,11 @@ for combinations that the integration rejects.
 
 ## Export trained weights
 
-Prepare a local base-model snapshot with its tokenizer, the matching gate and
-adapter checkpoints, and the training `params.json`. An evidence manifest
-records their hashes, training step, selection policy, and source revision;
-its [required fields](../design/token_gate.md#checkpoint-format) are documented
-in the design page.
+Prepare a local Hugging Face base-model snapshot with its tokenizer and the
+TokenGate checkpoint pair: `gate_stepN.pt` with `lora_stepN.pt`.
+The exporter also accepts name-paired `final` and `swa_` checkpoints. Both files
+must come from the same checkpoint directory. Gate settings and adapter targets
+are read from the gate's metadata.
 
 The exporter is a standalone script in the vLLM source checkout. With vLLM
 installed in your environment, run from the repository root using an output
@@ -60,10 +60,8 @@ directory that does not exist:
 ```console
 python tools/export_token_gate.py \
     --base /models/qwen3 \
-    --gate /run/gate.pt \
-    --adapter /run/adapter.pt \
-    --params /run/params.json \
-    --evidence /run/evidence.json \
+    --gate /run/gate_step3000.pt \
+    --adapter /run/lora_step3000.pt \
     --output /models/qwen3-token-gate
 ```
 
@@ -78,7 +76,7 @@ This is useful for comparing execution with and without TokenGate. It retains
 the jointly trained adapter; a paper-style SFT baseline requires its own
 independently trained adapter.
 
-Before relying on an export, compare it with the original research checkpoint.
+Before relying on an export, compare it with the original TokenGate checkpoint.
 BF16 adapter merging can change gate scores and the ordering of nearly tied
 tokens. Successful export verifies the files and configuration, not model
 accuracy or numerical agreement.
@@ -231,13 +229,11 @@ VLLM_USE_V2_MODEL_RUNNER=1 python -m pytest tests/token_gate
 
 The tests cover small real checkpoints, independent attention calculations,
 the Hugging Face recurrent implementation, and public generation APIs. They do
-not establish quality or speed for a trained checkpoint. Initial short Qwen3
-and Qwen3.5 TokenGate training pilots failed strict numerical comparisons with
-the research implementation; the Qwen3.5 pilots also lost retrieval accuracy.
-Those pilots do not establish an accuracy-preserving speedup.
+not establish quality or speed for the published full-size checkpoints. Those
+checkpoints require their own numerical and task-level evaluation.
 
 For a trained model, compare the original checkpoint with its merged export,
-then compare research execution with vLLM. Check retained tokens, numerical
+then compare the original TokenGate implementation with vLLM. Check retained tokens, numerical
 agreement, and task accuracy before reporting latency or memory improvements.
 The [design page](../design/token_gate.md#validation) describes these checks.
 

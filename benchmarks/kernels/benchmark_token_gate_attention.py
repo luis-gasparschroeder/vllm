@@ -113,7 +113,37 @@ def measure(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--shape",
+        type=int,
+        nargs=3,
+        action="append",
+        metavar=("HEADS", "KV_HEADS", "HEAD_SIZE"),
+        help="Repeat to benchmark multiple model attention shapes",
+    )
+    parser.add_argument(
+        "--sequence-lengths", type=int, nargs="+", default=[2048, 16384]
+    )
+    parser.add_argument("--query-lengths", type=int, nargs="+", default=[1, 128, 2048])
+    parser.add_argument(
+        "--full-prefill",
+        action="store_true",
+        help="Also measure query length equal to each context length",
+    )
     args = parser.parse_args()
+    shapes = args.shape or [(8, 2, 64), (16, 8, 128)]
+    if any(min(shape) < 1 or shape[0] % shape[1] for shape in shapes):
+        parser.error(
+            "head counts and dimensions must be positive; "
+            "heads must be divisible by KV heads"
+        )
+    if min(args.sequence_lengths + args.query_lengths) < 1:
+        parser.error("sequence and query lengths must be positive")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.output.exists():
+        parser.error(
+            "choose a new output path; existing measurements are not overwritten"
+        )
     # Never label a silent CUDA-event fallback as a CUPTI measurement.
     warnings.filterwarnings("error", message=".*Falling back to CUDA events.*")
     torch.manual_seed(19)
@@ -125,9 +155,14 @@ def main() -> None:
         timing="CUPTI, CUDA graph, cold L2; production launch heuristic",
         cases=[],
     )
-    for heads, kv_heads, size in ((8, 2, 64), (16, 8, 128)):
-        for sequence_length in (2048, 16384):
-            for query_length in (1, 128, 2048):
+    for heads, kv_heads, size in shapes:
+        for sequence_length in args.sequence_lengths:
+            queries = set(args.query_lengths)
+            if args.full_prefill:
+                queries.add(sequence_length)
+            for query_length in sorted(queries):
+                if query_length > sequence_length:
+                    continue
                 row = measure(query_length, sequence_length, heads, kv_heads, size)
                 result["cases"].append(row)
                 print(json.dumps(row), flush=True)

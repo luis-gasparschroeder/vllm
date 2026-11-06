@@ -4,11 +4,10 @@
 
 These helpers create randomly initialized Qwen3 or text-only Qwen3.5 models,
 a tokenizer, a token-filtering gate, and adapter updates to model weights.
-They write the same files and training-record metadata that the exporter
+They write the current TokenGate gate/adapter files that the exporter
 expects, allowing tests to exercise real model loading and inference APIs.
 """
 
-import json
 from pathlib import Path
 
 import torch
@@ -24,9 +23,7 @@ from transformers import (
 )
 
 from tools.export_token_gate import (
-    artifact_sha256,
     export_checkpoint,
-    tokenizer_sha256,
 )
 
 
@@ -120,7 +117,6 @@ def create_artifacts(
         "n_heads": 2,
         "n_layers_bias": len(upper_layers),
         "selection_mode": "topk",
-        "random_topk": False,
         "metadata": metadata,
         "head_agg": "avg",
         "per_layer_gate": True,
@@ -146,7 +142,7 @@ def create_artifacts(
             "agg_weights": torch.full((2,), 0.5),
         },
     }
-    gate_path, adapter_path = root / "gate.pt", root / "adapter.pt"
+    gate_path, adapter_path = root / "gate_step7.pt", root / "lora_step7.pt"
     torch.save(gate, gate_path)
     torch.save(
         {
@@ -159,48 +155,7 @@ def create_artifacts(
         },
         adapter_path,
     )
-    params_path = root / "params.json"
-    params_path.write_text(
-        json.dumps(
-            {
-                "base_model": base_name,
-                "gate_layer": gate_layer,
-                "gate_selection": "topk",
-                "random_topk": False,
-            }
-        )
-    )
-    evidence_path = root / "evidence.json"
-    evidence_path.write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "selection_mode": "topk",
-                "random_topk": False,
-                "gate_step": 7,
-                "adapter_step": 7,
-                "base_model": base_name,
-                "reference_revision": "f78ec10aaa77",
-                "run_id": "synthetic-test-fixture",
-                "gate_sha256": artifact_sha256(gate_path),
-                "adapter_sha256": artifact_sha256(adapter_path),
-                "params_sha256": artifact_sha256(params_path),
-                "tokenizer_sha256": tokenizer_sha256(base),
-                "base_config_sha256": artifact_sha256(base / "config.json"),
-                "base_weight_sha256": {
-                    path.name: artifact_sha256(path)
-                    for path in base.glob("*.safetensors")
-                },
-            }
-        )
-    )
-    return dict(
-        base_path=base,
-        gate_path=gate_path,
-        adapter_path=adapter_path,
-        params_path=params_path,
-        evidence_path=evidence_path,
-    )
+    return {"base_path": base, "gate_path": gate_path, "adapter_path": adapter_path}
 
 
 def create_export(

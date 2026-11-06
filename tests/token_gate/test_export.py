@@ -67,8 +67,9 @@ def test_hybrid_export_preserves_topology_and_native_query_gate(
         state["model.layers.0.linear_attn.in_proj_qkv.weight"],
         base["model.layers.0.linear_attn.in_proj_qkv.weight"],
     )
-    evidence = json.loads((output / "token_gate_export_evidence.json").read_text())
-    assert evidence["format_version"] == 1
+    assert config.token_gate["provenance"]["inference_defaults"] == {
+        "random_topk": False
+    }
 
 
 @pytest.mark.parametrize("declared", [[4, 7], [7, 3], [3], [True, 7], None])
@@ -100,16 +101,6 @@ def test_hybrid_export_extracts_complete_language_model_from_wrapper(tmp_path):
     ).bfloat16()
     wrapper.model.language_model.load_state_dict(text.model.state_dict())
     wrapper.save_pretrained(artifacts["base_path"])
-    path = artifacts["evidence_path"]
-    evidence = json.loads(path.read_text())
-    evidence["base_config_sha256"] = artifact_sha256(
-        artifacts["base_path"] / "config.json"
-    )
-    evidence["base_weight_sha256"] = {
-        entry.name: artifact_sha256(entry)
-        for entry in artifacts["base_path"].glob("*.safetensors")
-    }
-    path.write_text(json.dumps(evidence))
     output = tmp_path / "export"
     export_checkpoint(**artifacts, output_path=output)
     config = AutoConfig.from_pretrained(output)
@@ -150,31 +141,48 @@ def test_matched_baseline_uses_existing_qwen3_without_gate(artifacts, tmp_path):
     assert config.architectures == ["Qwen3ForCausalLM"]
     assert not hasattr(config, "token_gate")
     assert not any(".token_gate." in key for key in state)
+    record = json.loads((output / "token_gate_export_manifest.json").read_text())
+    assert record["sources"]["gate_sha256"] == artifact_sha256(artifacts["gate_path"])
+    assert record["sources"]["adapter_sha256"] == artifact_sha256(
+        artifacts["adapter_path"]
+    )
+    assert record["files"] == {
+        path.name: artifact_sha256(path)
+        for path in output.iterdir()
+        if path.name != "token_gate_export_manifest.json"
+    }
 
 
 @pytest.mark.parametrize(
-    "field,value",
-    [
-        ("gate_sha256", "wrong"),
-        ("adapter_sha256", "wrong"),
-        ("params_sha256", "wrong"),
-        ("tokenizer_sha256", "wrong"),
-        ("adapter_step", 8),
-        ("selection_mode", "threshold"),
-        ("random_topk", True),
-    ],
+    "field,value", [("selection_mode", "threshold"), ("random_topk", True)]
 )
-def test_export_rejects_unverified_or_unsupported_artifacts(
-    artifacts, tmp_path, field, value
-):
-    path = artifacts["evidence_path"]
-    evidence = json.loads(path.read_text())
-    evidence[field] = value
-    path.write_text(json.dumps(evidence))
-    output = tmp_path / "rejected"
-    with pytest.raises(ValueError):
-        export_checkpoint(**artifacts, output_path=output)
-    assert not output.exists()
+def test_export_rejects_unsupported_selection(artifacts, tmp_path, field, value):
+    gate = torch.load(artifacts["gate_path"], weights_only=True)
+    gate[field] = value
+    torch.save(gate, artifacts["gate_path"])
+    with pytest.raises(ValueError, match="Unsupported selection"):
+        export_checkpoint(**artifacts, output_path=tmp_path / "rejected")
+    assert not (tmp_path / "rejected").exists()
+
+
+@pytest.mark.parametrize(
+    "filename", ["lora_step8.pt", "lora_final.pt", "swa_lora_step7.pt"]
+)
+def test_export_rejects_unpaired_adapter(artifacts, tmp_path, filename):
+    old = artifacts["adapter_path"]
+    artifacts["adapter_path"] = old.with_name(filename)
+    old.rename(artifacts["adapter_path"])
+    with pytest.raises(ValueError, match="name-paired"):
+        export_checkpoint(**artifacts, output_path=tmp_path / "rejected")
+    assert not (tmp_path / "rejected").exists()
+
+
+def test_export_rejects_conflicting_step(artifacts, tmp_path):
+    gate = torch.load(artifacts["gate_path"], weights_only=True)
+    gate["metadata"]["step"] = 8
+    torch.save(gate, artifacts["gate_path"])
+    with pytest.raises(ValueError, match="step disagree"):
+        export_checkpoint(**artifacts, output_path=tmp_path / "rejected")
 
 
 @pytest.mark.parametrize(
@@ -215,9 +223,7 @@ def test_span_helper_aligns_full_tokenization(
         ("partial_adapter", "Incomplete adapter tensors"),
     ],
 )
-def test_hashed_artifacts_still_require_complete_valid_tensors(
-    artifacts, tmp_path, case, message
-):
+def test_export_requires_complete_valid_tensors(artifacts, tmp_path, case, message):
     kind = "gate" if case.endswith("gate") else "adapter"
     path = artifacts[kind + "_path"]
     artifact = torch.load(path, weights_only=True)
@@ -230,21 +236,10 @@ def test_hashed_artifacts_still_require_complete_valid_tensors(
     else:
         del artifact["model.layers.0.self_attn.q_proj.lora_B"]
     torch.save(artifact, path)
-    evidence_path = artifacts["evidence_path"]
-    evidence = json.loads(evidence_path.read_text())
-    evidence[kind + "_sha256"] = artifact_sha256(path)
-    evidence_path.write_text(json.dumps(evidence))
     output = tmp_path / "rejected"
     with pytest.raises(ValueError, match=message):
         export_checkpoint(**artifacts, output_path=output)
     assert not output.exists()
-
-
-def rehash(artifacts, kind):
-    path = artifacts["evidence_path"]
-    evidence = json.loads(path.read_text())
-    evidence[kind + "_sha256"] = artifact_sha256(artifacts[kind + "_path"])
-    path.write_text(json.dumps(evidence))
 
 
 @pytest.mark.parametrize(
@@ -261,11 +256,10 @@ def rehash(artifacts, kind):
         ("score_source", "keys"),
     ],
 )
-def test_export_rejects_removed_research_semantics(artifacts, tmp_path, field, value):
+def test_export_rejects_unsupported_gate_settings(artifacts, tmp_path, field, value):
     gate = torch.load(artifacts["gate_path"], weights_only=True)
     gate[field] = value
     torch.save(gate, artifacts["gate_path"])
-    rehash(artifacts, "gate")
     with pytest.raises(ValueError, match=field):
         export_checkpoint(**artifacts, output_path=tmp_path / "rejected")
     assert not (tmp_path / "rejected").exists()
@@ -305,9 +299,7 @@ def test_export_rejects_entire_missing_adapter_targets(
             for target in targets
         }
         torch.save(state, artifacts["adapter_path"])
-        rehash(artifacts, "adapter")
     torch.save(gate, artifacts["gate_path"])
-    rehash(artifacts, "gate")
     with pytest.raises(ValueError, match="adapter"):
         export_checkpoint(**artifacts, output_path=tmp_path / "rejected")
     assert not (tmp_path / "rejected").exists()
@@ -318,7 +310,6 @@ def test_export_rejects_nonfinite_scaling_or_merged_weights(artifacts, tmp_path,
     gate = torch.load(artifacts["gate_path"], weights_only=True)
     gate["metadata"]["lora_alpha"] = alpha
     torch.save(gate, artifacts["gate_path"])
-    rehash(artifacts, "gate")
     with pytest.raises(ValueError, match="[Nn]onfinite|scaling"):
         export_checkpoint(**artifacts, output_path=tmp_path / "rejected")
     assert not (tmp_path / "rejected").exists()
@@ -328,12 +319,6 @@ def test_export_rejects_retrospective_sliding_attention(artifacts, tmp_path):
     config = AutoConfig.from_pretrained(artifacts["base_path"])
     config.rswa_window = 8
     config.save_pretrained(artifacts["base_path"])
-    evidence_path = artifacts["evidence_path"]
-    evidence = json.loads(evidence_path.read_text())
-    evidence["base_config_sha256"] = artifact_sha256(
-        artifacts["base_path"] / "config.json"
-    )
-    evidence_path.write_text(json.dumps(evidence))
     with pytest.raises(ValueError, match="full attention"):
         export_checkpoint(**artifacts, output_path=tmp_path / "rejected")
     assert not (tmp_path / "rejected").exists()
@@ -343,7 +328,7 @@ def test_export_rejects_retrospective_sliding_attention(artifacts, tmp_path):
 def test_export_resolves_complete_adapter_defaults(artifacts, tmp_path, kind):
     gate = torch.load(artifacts["gate_path"], weights_only=True)
     gate["metadata"].update(adapter_type=kind, lora_targets=None)
-    del gate["metadata"]["lora_layer_ids"]  # The legacy default is the gate layer.
+    del gate["metadata"]["lora_layer_ids"]  # Omitted layer IDs select the gate layer.
     base = load_file(artifacts["base_path"] / "model.safetensors")
     targets = [
         "self_attn.q_proj",
@@ -369,8 +354,6 @@ def test_export_resolves_complete_adapter_defaults(artifacts, tmp_path, kind):
         expected[name + ".weight"] = (weight.float() + delta).bfloat16()
     torch.save(state, artifacts["adapter_path"])
     torch.save(gate, artifacts["gate_path"])
-    rehash(artifacts, "adapter")
-    rehash(artifacts, "gate")
     output = tmp_path / "defaults"
     export_checkpoint(**artifacts, output_path=output)
     actual = load_file(output / "model.safetensors")
@@ -382,7 +365,6 @@ def test_export_resolves_complete_adapter_defaults(artifacts, tmp_path, kind):
             torch.finfo(torch.float32).max
         )
         torch.save(state, artifacts["adapter_path"])
-        rehash(artifacts, "adapter")
         with pytest.raises(ValueError, match="Nonfinite merged"):
             export_checkpoint(**artifacts, output_path=tmp_path / "overflow")
         assert not (tmp_path / "overflow").exists()

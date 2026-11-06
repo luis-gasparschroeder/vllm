@@ -16,13 +16,13 @@ import math
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
 from torch import nn
 
 from vllm.config.token_gate import TokenGateConfig, attention_layer_indices
 
 TOKEN_GATE_FORMAT_VERSION = 2
-EXPORT_EVIDENCE_FORMAT_VERSION = 1
 GATE_WEIGHT_NAMES = {
     "gate_branch.gate_proj.weight": "input_gate.weight",
     "gate_branch.up_proj.weight": "input_up.weight",
@@ -78,107 +78,65 @@ def tokenizer_sha256(directory: str | Path) -> str:
     return digest.hexdigest()
 
 
-def validate_export_evidence(
-    gate: dict[str, Any],
-    evidence: dict[str, Any],
-    *,
-    gate_path: Path,
-    adapter_path: Path,
-    params_path: Path,
-    base_path: Path,
+def checkpoint_provenance(
+    gate: dict[str, Any], gate_path: Path, adapter_path: Path, base_path: Path
 ) -> dict[str, Any]:
-    """Verify that the base model, gate, and adapter match the export manifest.
+    """Validate the TokenGate checkpoint pair and record its source hashes.
 
-    Checks file hashes, checkpoint identities, training steps, and the supported
-    selection policy before the model is loaded or modified.
+    Gate settings and adapter targets come from the gate checkpoint itself.
+    Missing selection settings use the original TokenGate loader's defaults.
 
     Args:
-        gate: Loaded gate checkpoint, including its training metadata.
-        evidence: Manifest recording expected hashes and training identities.
-        gate_path: Gate checkpoint file.
-        adapter_path: Adapter checkpoint file.
-        params_path: JSON file containing the training parameters.
-        base_path: Local base-model directory, including weights and tokenizer.
+        gate: Loaded gate checkpoint and its metadata.
+        gate_path: A gate_stepN.pt, gate_final.pt, or corresponding SWA file.
+        adapter_path: Name-paired lora file in the same checkpoint directory.
+        base_path: Local Hugging Face model and tokenizer directory.
 
     Returns:
-        Verified file hashes and training identities for the exported config.
+        Source filenames, hashes, metadata, and applied inference defaults.
 
     Raises:
-        ValueError: Required evidence is missing, inconsistent, or unsupported.
+        ValueError: The files are not a pair or declare unsupported selection.
 
     """
+    match = re.fullmatch(r"(swa_)?gate_(step([0-9]+)|final)\.pt", gate_path.name)
+    if match is None:
+        raise ValueError("Expected a TokenGate gate_stepN.pt or gate_final.pt")
+    expected = f"{match[1] or ''}lora_{match[2]}.pt"
     if (
-        type(evidence.get("format_version")) is not int
-        or evidence["format_version"] != EXPORT_EVIDENCE_FORMAT_VERSION
+        adapter_path.name != expected
+        or adapter_path.parent.resolve() != gate_path.parent.resolve()
     ):
-        raise ValueError("Unsupported evidence format")
-    hashes = {
+        raise ValueError("Adapter must be the name-paired lora file beside the gate")
+    metadata = gate.get("metadata", {})
+    step = metadata.get("step")
+    if type(step) is not int or step < 0 or (match[3] and int(match[3]) != step):
+        raise ValueError("Gate filename and checkpoint step disagree")
+    if not isinstance(metadata.get("base_model"), str) or not metadata["base_model"]:
+        raise ValueError("Gate metadata must identify the base model")
+    defaults = {}
+    for name, expected in (("selection_mode", "topk"), ("random_topk", False)):
+        actual = gate.get(name, expected)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError(f"Unsupported selection setting: {name}")
+        if name not in gate:
+            defaults[name] = expected
+    weights = {
+        p.name: artifact_sha256(p) for p in sorted(base_path.glob("*.safetensors"))
+    }
+    if not weights:
+        raise ValueError("No base-model safetensors found")
+    return {
+        "base_model": metadata["base_model"],
+        "step": step,
+        "gate_file": gate_path.name,
+        "adapter_file": adapter_path.name,
         "gate_sha256": artifact_sha256(gate_path),
         "adapter_sha256": artifact_sha256(adapter_path),
-        "params_sha256": artifact_sha256(params_path),
         "tokenizer_sha256": tokenizer_sha256(base_path),
-    }
-    for name, expected_hash in hashes.items():
-        if evidence.get(name) != expected_hash:
-            raise ValueError(f"Evidence mismatch: {name}")
-    params = json.loads(params_path.read_text())
-    metadata = gate.get("metadata", {})
-    for key, expected in (("selection_mode", "topk"), ("random_topk", False)):
-        if type(evidence.get(key)) is not type(expected) or evidence[key] != expected:
-            raise ValueError(f"Export requires verified {key}={expected!r}")
-        if key in gate and (
-            type(gate[key]) is not type(expected) or gate[key] != expected
-        ):
-            raise ValueError(f"Gate policy conflicts with evidence: {key}")
-        params_key = "gate_selection" if key == "selection_mode" else key
-        if params_key not in params or type(params[params_key]) is not type(expected):
-            raise ValueError(f"Hashed training params must explicitly record {key}")
-        if params[params_key] != expected:
-            raise ValueError(f"Training policy is unsupported: {key}")
-    step = metadata.get("step")
-    if (
-        type(step) is not int
-        or type(evidence.get("gate_step")) is not int
-        or type(evidence.get("adapter_step")) is not int
-        or step != evidence.get("gate_step")
-        or (step != evidence.get("adapter_step"))
-    ):
-        raise ValueError("Gate and adapter must have the same verified training step")
-    for key in ("base_model", "reference_revision", "run_id"):
-        if not isinstance(evidence.get(key), str) or not evidence[key]:
-            raise ValueError(f"Evidence must identify {key}")
-    if metadata.get("base_model") != evidence["base_model"]:
-        raise ValueError("Gate base model conflicts with evidence")
-    if params.get("base_model") != evidence["base_model"]:
-        raise ValueError("Training base model conflicts with evidence")
-    if params.get("gate_layer") != metadata.get("gate_layer"):
-        raise ValueError("Training gate layer conflicts with checkpoint")
-    if "run_id" in metadata and metadata["run_id"] != evidence["run_id"]:
-        raise ValueError("Checkpoint run identity conflicts with evidence")
-    if "run_id" in params and params["run_id"] != evidence["run_id"]:
-        raise ValueError("Training run identity conflicts with evidence")
-    if (
-        "params_sha256" in metadata
-        and metadata["params_sha256"] != hashes["params_sha256"]
-    ):
-        raise ValueError("Checkpoint training params conflict with evidence")
-    # A local snapshot must itself be pinned; filenames alone are not an identity.
-    config_hash = artifact_sha256(base_path / "config.json")
-    if evidence.get("base_config_sha256") != config_hash:
-        raise ValueError("Base configuration conflicts with evidence")
-    weights = sorted(base_path.glob("*.safetensors"))
-    weight_hashes = {path.name: artifact_sha256(path) for path in weights}
-    if not weights or evidence.get("base_weight_sha256") != weight_hashes:
-        raise ValueError("Base weights conflict with evidence")
-    return {
-        **hashes,
-        "base_model": evidence["base_model"],
-        "base_config_sha256": config_hash,
-        "base_weight_sha256": weight_hashes,
-        "reference_revision": evidence["reference_revision"],
-        "run_id": evidence["run_id"],
-        "step": step,
-        "selection_policy": "hashed_training_params_and_artifact_manifest",
+        "base_config_sha256": artifact_sha256(base_path / "config.json"),
+        "base_weight_sha256": weights,
+        "inference_defaults": defaults,
     }
 
 
@@ -217,8 +175,7 @@ def export_gate_weights(
     for name, expected in constants.items():
         if gate.get(name) != expected:
             raise ValueError(f"Unsupported or missing gate architecture field: {name}")
-    # The research loader assigns these defaults to older frozen-architecture
-    # checkpoints. Explicit declarations of removed variants must still fail.
+    # Match the TokenGate loader defaults; reject unsupported explicit settings.
     defaults = {
         "n_input_layers": 1,
         "score_source": "hidden",
@@ -435,8 +392,6 @@ def export_checkpoint(
     base_path: Path,
     gate_path: Path,
     adapter_path: Path,
-    params_path: Path,
-    evidence_path: Path,
     output_path: Path,
     *,
     include_gate: bool = True,
@@ -444,21 +399,19 @@ def export_checkpoint(
     """Write a model export with merged adapter weights and optional TokenGate.
 
     Loads local files on CPU and saves the model, tokenizer, and export manifest
-    in a new directory. Gate and adapter evidence is checked even when the gate
-    is omitted from the output.
+    in a new directory. Gate settings and adapter tensors are checked even
+    when the gate is omitted from the output.
 
     Args:
         base_path: Local Hugging Face base-model and tokenizer directory.
         gate_path: Gate checkpoint containing its tensors and training metadata.
         adapter_path: LoRA or delta adapter checkpoint from the same training step.
-        params_path: JSON training parameters referenced by the manifest.
-        evidence_path: JSON manifest of expected file hashes and training identities.
         output_path: Destination directory, which must not already exist.
         include_gate: Whether to include gate weights and configuration. False
             exports the same merged adapter weights without token filtering.
 
     Raises:
-        ValueError: The destination exists, evidence or weights are inconsistent,
+        ValueError: The destination exists, metadata or weights are inconsistent,
             or the checkpoint uses an unsupported configuration.
 
     """
@@ -468,15 +421,7 @@ def export_checkpoint(
         raise ValueError("Export destination must not already exist")
     gate = torch.load(gate_path, map_location="cpu", weights_only=True)
     adapter = torch.load(adapter_path, map_location="cpu", weights_only=True)
-    evidence = json.loads(evidence_path.read_text())
-    provenance = validate_export_evidence(
-        gate,
-        evidence,
-        gate_path=gate_path,
-        adapter_path=adapter_path,
-        params_path=params_path,
-        base_path=base_path,
-    )
+    provenance = checkpoint_provenance(gate, gate_path, adapter_path, base_path)
     model, loading_info = AutoModelForCausalLM.from_pretrained(
         base_path,
         dtype=torch.bfloat16,
@@ -522,14 +467,19 @@ def export_checkpoint(
         save_original_format=False,
     )
     tokenizer.save_pretrained(output_path)
-    (output_path / "token_gate_export_evidence.json").write_text(
-        json.dumps(evidence, indent=2) + "\n"
+    manifest = {
+        str(path.relative_to(output_path)): artifact_sha256(path)
+        for path in sorted(output_path.rglob("*"))
+        if path.is_file()
+    }
+    (output_path / "token_gate_export_manifest.json").write_text(
+        json.dumps({"sources": provenance, "files": manifest}, indent=2) + "\n"
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("base", "gate", "adapter", "params", "evidence", "output"):
+    for name in ("base", "gate", "adapter", "output"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument(
         "--without-token-gate",
@@ -541,8 +491,6 @@ def main() -> None:
         args.base,
         args.gate,
         args.adapter,
-        args.params,
-        args.evidence,
         args.output,
         include_gate=not args.without_token_gate,
     )
