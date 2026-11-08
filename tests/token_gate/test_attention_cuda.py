@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Check that TokenGate's attention adjustments work with a paged GPU cache.
+"""Check TokenGate attention during full prefill and paged-cache generation.
 
 The learned token scores add a bias to attention for the prompt tokens that
-remain after filtering. These tests compare the Triton kernel with a direct
-dense calculation during prompt processing and next-token generation, including
+remain after filtering. The tiled and paged Triton kernels are compared with
+a direct dense calculation during prompt processing and generation, including
 keys already in the cache. They also check that a zero bias leaves ordinary
 attention outputs unchanged.
 """
@@ -13,6 +13,40 @@ import pytest
 import torch
 
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+
+@pytest.mark.parametrize(
+    "heads,kv_heads,size", [(4, 2, 64), (4, 1, 96), (16, 8, 128), (8, 2, 256)]
+)
+@pytest.mark.parametrize("length", [17, 129, 513])
+@pytest.mark.parametrize("bias_scale", [0.0, 1.0, 8.0])
+@pytest.mark.parametrize("tile", [None, (128, 64, 4, 2)])
+def test_tiled_prefill_matches_dense_reference(
+    heads, kv_heads, size, length, bias_scale, tile
+):
+    from vllm.v1.attention.ops.token_gate_attention import token_gate_prefill
+
+    torch.manual_seed(19)
+    device, dtype = "cuda", torch.bfloat16
+    # Interleaved views reproduce QKV projection strides, without copying K/V.
+    qkv = torch.randn(length, heads + 2 * kv_heads, size, device=device, dtype=dtype)
+    query, key, value = qkv.split([heads, kv_heads, kv_heads], dim=1)
+    prefix = length - 3
+    bias = torch.randn(heads, prefix + 1, device=device, dtype=dtype)[:, 1:].T
+    bias.mul_(bias_scale)
+    output = torch.empty_like(query, memory_format=torch.contiguous_format)
+    token_gate_prefill(query, key, value, bias, output, size**-0.5, tile=tile)
+    dense_key = key.repeat_interleave(heads // kv_heads, dim=1)
+    dense_value = value.repeat_interleave(heads // kv_heads, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", query.float(), dense_key.float()) / size**0.5
+    scores[:, :, :prefix] += bias.T[:, None].float()
+    causal = (
+        torch.arange(length, device=device)[:, None]
+        >= torch.arange(length, device=device)[None, :]
+    )
+    scores.masked_fill_(~causal[None], float("-inf"))
+    expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1).to(dtype), dense_value)
+    torch.testing.assert_close(output, expected, atol=1.5e-2, rtol=1.5e-2)
 
 
 @pytest.mark.parametrize("size", [64, 256])

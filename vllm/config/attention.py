@@ -40,6 +40,13 @@ class AttentionConfig:
     backend: AttentionBackendEnum | None = None
     """Attention backend to use. Use "auto" or None for automatic selection."""
 
+    token_gate_prefill_backend: Literal["triton", "tiled"] = "triton"
+    """TokenGate full-prompt attention implementation. "tiled" reads retained
+    Q/K/V directly with a dedicated Triton kernel; decode and replay retain
+    paged attention. This does not change attention before the gate or ordinary
+    models. Unsupported attention modifiers use the paged path.
+    """
+
     minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = "cutlass"
     """Sparse decode kernel used by the MiniMax M3 MSA backend. "cutlass" falls
     back to Triton where the CUTLASS kernel does not support the platform, KV

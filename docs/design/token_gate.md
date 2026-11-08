@@ -87,11 +87,21 @@ Floating-point order is also part of that behavior:
 | Decode query scaling | Multiply gain and ratio in FP32, then cast the product to BF16. |
 | Prompt-key bias | Cast $G_{\ell h}b_j$ to BF16; multiply by the mean over heads of the separately cast gain–ratio products. |
 
-`TokenGateAttentionImpl` scales queries and passes the prompt-key bias to
-unified Triton paged attention. The bias applies to cached prompt keys during
-decode as well as prefill; generated keys have no bias. The kernel handles both
-direct and split softmax paths. Ordinary attention compiles without this branch.
-Full retention still applies the learned gains and scores.
+`TokenGateAttentionImpl` scales queries and prepares the prompt-key bias. The
+`attention_config.token_gate_prefill_backend` setting selects full-prompt
+attention:
+
+- `triton` (default) reads the paged cache through unified Triton attention.
+- `tiled` uses a dedicated Triton kernel on the retained Q/K/V tensors already
+  produced by the model. It loads each key's bias once per tile and reuses it
+  across query rows, with FP32 online softmax and accumulation. Bias values are
+  arranged contiguously by head before launch. Normal KV writes still populate
+  the paged cache for decoding.
+
+The tiled path supports head dimensions up to 256 with ordinary causal attention;
+other shapes or attention modifiers use the paged path. Decode and replay
+containing generated tokens also use paged attention. Launch geometry depends
+only on tensor shape
 
 ### Qwen3.5 full-attention layers
 

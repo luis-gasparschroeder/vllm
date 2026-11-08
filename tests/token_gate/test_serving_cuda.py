@@ -46,8 +46,9 @@ def snapshot_recurrent_state(worker):
 
 @pytest.mark.parametrize("hybrid,gate_layer", [(False, 0), (True, 1), (True, 3)])
 @pytest.mark.parametrize("backend", [None, "TRITON_ATTN"])
+@pytest.mark.parametrize("prefill_backend", ["triton", "tiled"])
 def test_public_generation_matches_dense_reference(
-    vllm_runner, tmp_path, monkeypatch, backend, hybrid, gate_layer
+    vllm_runner, tmp_path, monkeypatch, backend, hybrid, gate_layer, prefill_backend
 ):
     # Advance exactly one engine step at a time so reset/abort precedes completion.
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -103,7 +104,10 @@ def test_public_generation_matches_dense_reference(
         enable_prefix_caching=False,
         async_scheduling=False,
         max_logprobs=128,
-        attention_config={"backend": backend},
+        attention_config={
+            "backend": backend,
+            "token_gate_prefill_backend": prefill_backend,
+        },
         kv_cache_memory_bytes=64 * 1024 * 1024,
     ) as runner:
         for invalid in (

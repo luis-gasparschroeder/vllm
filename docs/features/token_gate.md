@@ -249,3 +249,13 @@ attention at equal sequence lengths using the production launch heuristic.
 Scoring, token selection, metadata preparation, and output restoration are
 excluded. Measure end-to-end latency on matched checkpoints and fixed prompts
 to determine the benefit of pruning.
+
+## Select the prefill kernel
+
+The default TokenGate backend uses Triton paged attention. To use the dedicated
+tiled kernel for full prompt processing, pass
+`attention_config={"token_gate_prefill_backend": "tiled"}` to `LLM`, or
+`--attention-config '{"token_gate_prefill_backend":"tiled"}'` to the server.
+This uses vLLM's existing Triton dependency. Decode continues to read the paged
+cache. See the [design](../design/token_gate.md#attention-calculation) for supported
+shapes and fallback behavior.
