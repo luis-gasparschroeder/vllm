@@ -56,43 +56,54 @@ def _token_gate_prefill(
     maximum = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     normalizer = tl.full((BLOCK_M,), 1.0, tl.float32)
     accumulator = tl.full((BLOCK_M, PADDED_SIZE), 0.0, tl.float32)
-    for start in range(0, tl.minimum((block + 1) * BLOCK_M, length), BLOCK_N):
-        keys = start + columns
-        k = tl.load(
-            K
-            + keys.to(tl.int64)[None, :] * k_stride_n
-            + kv_head * k_stride_h
-            + dimensions[:, None],
-            (keys[None, :] < length) & (dimensions[:, None] < HEAD_SIZE),
-            0,
-        )
-        # One vector load per key tile; broadcast across the query rows.
-        bias = tl.load(
-            Bias + keys.to(tl.int64) * bias_stride_n + head * bias_stride_h,
-            keys < bias_length,
-            0,
-        ).to(tl.float32)
-        logits = tl.dot(q, k).to(tl.float32) * SCALE + bias[None, :]
-        logits = tl.where(
-            (rows[:, None] >= keys[None, :]) & (keys[None, :] < length),
-            logits * 1.4426950408889634,
-            -float("inf"),
-        )
-        next_maximum = tl.maximum(maximum, tl.max(logits, 1))
-        probabilities = tl.exp2(logits - next_maximum[:, None])
-        correction = tl.exp2(maximum - next_maximum)
-        normalizer = normalizer * correction + tl.sum(probabilities, 1)
-        accumulator = accumulator * correction[:, None]
-        v = tl.load(
-            V
-            + keys.to(tl.int64)[:, None] * v_stride_n
-            + kv_head * v_stride_h
-            + dimensions[None, :],
-            (keys[:, None] < length) & (dimensions[None, :] < HEAD_SIZE),
-            0,
-        )
-        accumulator = tl.dot(probabilities.to(v.dtype), v, accumulator)
-        maximum = next_maximum
+    # Whole key tiles before the first query row need no causal or length mask.
+    boundary = block * BLOCK_M // BLOCK_N * BLOCK_N
+    for stage in tl.static_range(2):
+        if stage == 0:
+            begin, end = 0, boundary
+        else:
+            begin, end = boundary, tl.minimum((block + 1) * BLOCK_M, length)
+        for start in range(begin, end, BLOCK_N):
+            keys = start + columns
+            k = tl.load(
+                K
+                + keys.to(tl.int64)[None, :] * k_stride_n
+                + kv_head * k_stride_h
+                + dimensions[:, None],
+                ((stage == 0) | (keys[None, :] < length))
+                & (dimensions[:, None] < HEAD_SIZE),
+                0,
+            )
+            # One vector load per key tile; broadcast across the query rows.
+            bias = tl.load(
+                Bias + keys.to(tl.int64) * bias_stride_n + head * bias_stride_h,
+                keys < bias_length,
+                0,
+            ).to(tl.float32)
+            logits = tl.dot(q, k).to(tl.float32) * SCALE + bias[None, :]
+            if stage == 1:
+                logits = tl.where(
+                    (rows[:, None] >= keys[None, :]) & (keys[None, :] < length),
+                    logits,
+                    -float("inf"),
+                )
+            logits *= 1.4426950408889634
+            next_maximum = tl.maximum(maximum, tl.max(logits, 1))
+            probabilities = tl.exp2(logits - next_maximum[:, None])
+            correction = tl.exp2(maximum - next_maximum)
+            normalizer = normalizer * correction + tl.sum(probabilities, 1)
+            accumulator = accumulator * correction[:, None]
+            v = tl.load(
+                V
+                + keys.to(tl.int64)[:, None] * v_stride_n
+                + kv_head * v_stride_h
+                + dimensions[None, :],
+                ((stage == 0) | (keys[:, None] < length))
+                & (dimensions[None, :] < HEAD_SIZE),
+                0,
+            )
+            accumulator = tl.dot(probabilities.to(v.dtype), v, accumulator)
+            maximum = next_maximum
     result = accumulator / normalizer[:, None]
     tl.store(
         Output
@@ -134,8 +145,9 @@ def token_gate_prefill(
     """
     length, heads, size = query.shape
     if tile is None:
+        # One pipeline stage leaves room for wider key tiles with large heads.
         tile = (
-            (64, 32, 4, 2)
+            (64, 64, 4, 1)
             if size > 128
             else ((128, 64, 4, 2) if length >= 16384 else (64, 64, 4, 2))
         )

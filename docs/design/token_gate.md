@@ -98,6 +98,12 @@ attention:
   arranged contiguously by head before launch. Normal KV writes still populate
   the paged cache for decoding.
 
+The tiled kernel separates fully visible key tiles from tiles that cross the
+causal boundary. Only the latter need causal and sequence-boundary masking.
+Both paths retain the same learned bias and online softmax calculation. For
+head dimensions above 128, a single pipeline stage keeps wider key tiles within
+the shared-memory budget.
+
 The tiled path supports head dimensions up to 256 with ordinary causal attention;
 other shapes or attention modifiers use the paged path. Decode and replay
 containing generated tokens also use paged attention. Launch geometry depends

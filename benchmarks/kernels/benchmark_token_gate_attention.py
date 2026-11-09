@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compare paged and tiled TokenGate attention with matched tensor shapes.
+"""Compare FlashAttention, paged and tiled TokenGate attention on matched tensors.
 
 Time ordinary paged attention, biased paged attention, and the dedicated tiled
-prefill kernel. Check a dense reference before using CUPTI, CUDA graphs, and
+prefill kernel. Full prefill also measures vLLM's ordinary FlashAttention.
+Check a dense reference before using CUPTI, CUDA graphs, and
 cold L2 timing. Query scaling, bias preparation, and KV writes are excluded;
 end-to-end benchmarks must include them. Optional tiles support controlled tuning.
 """
@@ -18,8 +19,11 @@ from pathlib import Path
 import torch
 from flashinfer.testing import bench_gpu_time_with_cupti
 
+from vllm.triton_utils import triton
+from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.ops.token_gate_attention import token_gate_prefill
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 
 @torch.inference_mode()
@@ -62,7 +66,7 @@ def measure(
         seq_threshold_3D=8,
         num_par_softmax_segments=16,
         softmax_segm_output=torch.empty(
-            query_length, heads, 16, head_size, device=device
+            query_length, heads, 16, triton.next_power_of_2(head_size), device=device
         ),
         softmax_segm_max=torch.empty(query_length, heads, 16, device=device),
         softmax_segm_expsum=torch.empty(query_length, heads, 16, device=device),
@@ -91,6 +95,8 @@ def measure(
         direct_key = key.flatten(0, 1)[:sequence_length]
         direct_value = value.flatten(0, 1)[:sequence_length]
         packed_bias = bias[0].T.contiguous().T
+        result["flash_attention_version"] = get_flash_attn_version(head_size=head_size)
+        variants.append(("flash_attention", None, None))
         variants.append(("tiled_bias", packed_bias, None))
         for tile in tiles or []:
             label = "tiled_" + "_".join(map(str, tile))
@@ -107,6 +113,20 @@ def measure(
                     output,
                     head_size**-0.5,
                     tile=tile,
+                )
+            elif label == "flash_attention":
+                flash_attn_varlen_func(
+                    query,
+                    direct_key,
+                    direct_value,
+                    query_length,
+                    kwargs["cu_seqlens_q"],
+                    sequence_length,
+                    kwargs["cu_seqlens_q"],
+                    softmax_scale=head_size**-0.5,
+                    causal=True,
+                    fa_version=result["flash_attention_version"],
+                    out=output,
                 )
             else:
                 unified_attention(**kwargs, key_bias=key_bias)

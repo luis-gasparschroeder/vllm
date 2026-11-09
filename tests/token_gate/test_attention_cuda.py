@@ -16,11 +16,12 @@ from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
 
 @pytest.mark.parametrize(
-    "heads,kv_heads,size", [(4, 2, 64), (4, 1, 96), (16, 8, 128), (8, 2, 256)]
+    "heads,kv_heads,size",
+    [(4, 2, 64), (4, 4, 64), (4, 1, 96), (16, 8, 128), (4, 1, 192), (8, 2, 256)],
 )
-@pytest.mark.parametrize("length", [17, 129, 513])
+@pytest.mark.parametrize("length", [1, 17, 64, 65, 129, 513])
 @pytest.mark.parametrize("bias_scale", [0.0, 1.0, 8.0])
-@pytest.mark.parametrize("tile", [None, (128, 64, 4, 2)])
+@pytest.mark.parametrize("tile", [None, (128, 32, 4, 1), (32, 64, 4, 2)])
 def test_tiled_prefill_matches_dense_reference(
     heads, kv_heads, size, length, bias_scale, tile
 ):
@@ -31,7 +32,7 @@ def test_tiled_prefill_matches_dense_reference(
     # Interleaved views reproduce QKV projection strides, without copying K/V.
     qkv = torch.randn(length, heads + 2 * kv_heads, size, device=device, dtype=dtype)
     query, key, value = qkv.split([heads, kv_heads, kv_heads], dim=1)
-    prefix = length - 3
+    prefix = max(0, length - 3)
     bias = torch.randn(heads, prefix + 1, device=device, dtype=dtype)[:, 1:].T
     bias.mul_(bias_scale)
     output = torch.empty_like(query, memory_format=torch.contiguous_format)
