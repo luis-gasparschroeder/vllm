@@ -128,7 +128,6 @@ class TokenGateConfig:
             "graphs or compilation": not model.enforce_eager,
             "chunked prefill": scheduler.enable_chunked_prefill,
             "async scheduling": scheduler.async_scheduling,
-            "multiple active requests": scheduler.max_num_seqs != 1,
             "prefill threshold": scheduler.long_prefill_token_threshold != 0,
             "prefix caching": cache.enable_prefix_caching,
             "quantized KV cache": cache.cache_dtype != "auto",

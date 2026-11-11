@@ -19,7 +19,11 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 from vllm.config.token_gate import TokenGateConfig
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
-from vllm.model_executor.layers.token_gate import TokenGate, TokenGateBatch
+from vllm.model_executor.layers.token_gate import (
+    TokenGate,
+    TokenGateBatch,
+    TokenGateSequence,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.token_gate import (
     TOKEN_GATE_FIELDS,
@@ -164,16 +168,18 @@ def test_compaction_preserves_residual_positions_and_output_rows():
     residual = torch.randn_like(hidden)
     batch = TokenGateBatch(
         0,
-        10,
-        7,
-        0,
-        TokenGateRequestOptions(2, 8, 3),
+        [
+            TokenGateSequence(
+                10,
+                7,
+                0,
+                12,
+                TokenGateRequestOptions(2, 8, 3),
+                torch.empty(7),
+                torch.empty(7),
+            )
+        ],
         torch.arange(12),
-        torch.empty(9, dtype=torch.int64),
-        torch.empty(9, dtype=torch.int64),
-        torch.empty(9),
-        torch.empty(7),
-        torch.empty(7),
     )
     compact, compact_residual = gate.compact(hidden, residual, batch)
     assert batch.retained_rows[:2].tolist() == [0, 1]
@@ -193,32 +199,39 @@ def test_replayed_generated_queries_use_decode_cast_order():
     with torch.no_grad():
         gate.gate_scale.copy_(torch.tensor([[0.77, 1.21]]))
         gate.attn_scale.copy_(torch.tensor([[0.13, 1.77]]))
-    ratios = torch.tensor([0.7031, 0.7031])
+    ratios = torch.full((8,), 0.7031)
     batch = TokenGateBatch(
         0,
-        10,
-        7,
-        0,
-        None,
-        torch.arange(2),
-        torch.tensor([9, 10]),
-        torch.arange(2),
-        ratios,
-        torch.ones(7),
-        torch.full((7,), 0.73),
+        [
+            TokenGateSequence(
+                10,
+                7,
+                0,
+                11,
+                TokenGateRequestOptions(2, 8, 3),
+                torch.ones(7),
+                torch.full((7,), 0.73),
+            )
+        ],
+        torch.arange(11),
     )
-    query = torch.ones(2, 2, 4, dtype=torch.bfloat16)
+    batch.upper_positions.copy_(torch.tensor([0, 1, 3, 5, 7, 8, 9, 10]))
+    batch.query_ratios.copy_(ratios)
+    batch.query_is_prompt.copy_(batch.upper_positions < 10)
+    batch.prompt_scores = torch.ones(1, 7)
+    batch.prompt_ratios = torch.full((1, 7), 0.73)
+    query = torch.ones(8, 2, 4, dtype=torch.bfloat16)
     transformed, bias = batch.attention_inputs(query, gate, 0)
     gain = torch.nn.functional.softplus(gate.attn_scale[0])
     prefill = gain.bfloat16() * ratios[0].bfloat16()
     decode = (gain * ratios[1]).bfloat16()
-    assert torch.equal(transformed[0, :, 0], prefill)
-    assert torch.equal(transformed[1, :, 0], decode)
+    assert torch.equal(transformed[-2, :, 0], prefill)
+    assert torch.equal(transformed[-1, :, 0], decode)
     expected_bias = torch.nn.functional.softplus(gate.gate_scale[0]).bfloat16()
     expected_bias = (
         expected_bias * (gain.bfloat16() * torch.tensor(0.73).bfloat16()).mean()
     )
-    assert torch.equal(bias[0], expected_bias)
+    assert torch.equal(bias[0, 0], expected_bias)
 
 
 @pytest.mark.parametrize(
@@ -296,3 +309,85 @@ def test_valid_sampling_preserves_aligned_coordinates():
     assert TokenGateRequestOptions.parse(
         params.extra_args, 10
     ) == TokenGateRequestOptions(2, 8, 3)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_packed_spans_normalize_independently(reverse):
+    """A large neighboring span must not change another request's gate scores."""
+    torch.manual_seed(19)
+    gate = TokenGate(8, 16, 1, 2)
+    spans = [torch.randn(9, 8), torch.randn(5, 8) * 20]
+    if reverse:
+        spans.reverse()
+    lengths = [span.shape[0] for span in spans]
+    actual = gate.score(torch.cat(spans), lengths).split(lengths)
+    for observed, span in zip(actual, spans):
+        torch.testing.assert_close(observed, gate.score(span))
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mixed_batch_preserves_request_boundaries_and_persistent_scores(reverse):
+    """Reorder a replay, a new prompt, and a decode without mixing their state."""
+    torch.manual_seed(17)
+    gate = TokenGate(8, 16, 1, 2)
+    with torch.no_grad():
+        gate.gate_scale.fill_(0.2)
+        gate.attn_scale.fill_(0.7)
+    # Prompt length, computed tokens, scheduled tokens, span, keep count.
+    cases = [(10, 0, 12, (2, 8, 3)), (7, 9, 1, (0, 6, 1)), (9, 0, 9, (1, 7, 2))]
+    if reverse:
+        cases.reverse()
+    requests, positions, hidden, residual = [], [], [], []
+    for prompt, computed, count, span in cases:
+        opts = TokenGateRequestOptions(*span)
+        retained = prompt - opts.removed_tokens
+        requests.append(
+            TokenGateSequence(
+                prompt,
+                retained,
+                computed,
+                count,
+                opts,
+                torch.linspace(0, 1, retained),
+                torch.linspace(0.5, 1, retained),
+            )
+        )
+        positions.append(torch.arange(computed, computed + count))
+        hidden.append(torch.randn(count, 8))
+        residual.append(torch.randn(count, 8))
+    expected = []
+    for request, pos, h, r in zip(requests, positions, hidden, residual):
+        independent = TokenGateSequence(
+            request.original_prompt_length,
+            request.retained_prompt_length,
+            request.num_computed_tokens,
+            request.num_tokens,
+            request.options,
+            request.prompt_scores.clone(),
+            request.prompt_ratios.clone(),
+        )
+        single = TokenGateBatch(0, [independent], pos)
+        compact, compact_residual = gate.compact(h, r, single)
+        q, bias = single.attention_inputs(compact.reshape(-1, 2, 4), gate, 0)
+        expected.append((single, compact, compact_residual, q, bias))
+    batch = TokenGateBatch(0, requests, torch.cat(positions))
+    assert batch.uncached_prefill_start == (None if reverse else 2)
+    compact, compact_residual = gate.compact(
+        torch.cat(hidden), torch.cat(residual), batch
+    )
+    scaled, bias = batch.attention_inputs(compact.reshape(-1, 2, 4), gate, 0)
+    restored = batch.restore_output(compact)
+    for i, (single, h, r, q, b) in enumerate(expected):
+        lo, hi = batch.output_offsets[i : i + 2]
+        in_lo, in_hi = batch.input_offsets[i : i + 2]
+        torch.testing.assert_close(compact[lo:hi], h)
+        torch.testing.assert_close(compact_residual[lo:hi], r)
+        torch.testing.assert_close(scaled[lo:hi], q)
+        width = requests[i].retained_prompt_length
+        torch.testing.assert_close(bias[i, :width], b[0])
+        assert torch.count_nonzero(bias[i, width:]) == 0
+        assert torch.equal(batch.retained_rows[lo:hi] - in_lo, single.retained_rows)
+        assert torch.equal(restored[in_hi - 1], hidden[i][-1])
+        torch.testing.assert_close(
+            requests[i].prompt_scores, single.requests[0].prompt_scores
+        )

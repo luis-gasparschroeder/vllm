@@ -9,7 +9,8 @@ During decode (generating new tokens), no tokens are pruned. Retained prompt
 scores and position corrections continue to adjust attention in later layers.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import accumulate
 
 import torch
 from torch import nn
@@ -106,20 +107,23 @@ class TokenGate(nn.Module):
         )
         self.epsilon = epsilon
 
-    def score(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Compute normalized pruning scores for one token span.
+    def score(
+        self, hidden_states: torch.Tensor, span_lengths: list[int] | None = None
+    ) -> torch.Tensor:
+        """Compute pruning scores, normalizing each packed span independently.
 
-        Normalization uses the root mean square across all supplied tokens, so
-        passing a different span can change the scores. Scores are signed values,
+        Normalization uses the root mean square within each supplied span, so
+        changing that span can change its scores. Scores are signed values,
         not probabilities; larger values receive higher retention priority.
 
         Args:
             hidden_states: Normalized states before the gate layer's MLP,
-                restricted to a nonempty prunable span. Shape is
-                [span_length, hidden_size], on the gate parameters' device.
+                restricted to packed nonempty prunable spans. Shape is
+                [total_span_tokens, hidden_size], on the gate parameters' device.
+            span_lengths: Length of each packed span; None means one span.
 
         Returns:
-            FP32 scores of shape [span_length], including normalization_weight,
+            FP32 scores of shape [total_span_tokens], including normalization_weight,
             on the input device.
 
         """
@@ -129,10 +133,11 @@ class TokenGate(nn.Module):
         raw = F.linear(gated * values, self.output.weight.to(dtype)).squeeze(-1)
         # Match prefill_batch_for_decode in the TokenGate reference repository:
         # normalize scalar scores in FP32 to avoid reduced-precision rounding.
-        normalized = raw.float() * torch.rsqrt(
-            raw.float().square().mean() + self.epsilon
-        )
-        return normalized * self.normalization_weight
+        spans = raw.float().split(span_lengths) if span_lengths else (raw.float(),)
+        normalized = [
+            span * torch.rsqrt(span.square().mean() + self.epsilon) for span in spans
+        ]
+        return torch.cat(normalized) * self.normalization_weight
 
     def select(self, scores: torch.Tensor, keep_tokens: int) -> torch.Tensor:
         """Choose the highest-scoring tokens and restore their sequence order.
@@ -161,124 +166,185 @@ class TokenGate(nn.Module):
         residual: torch.Tensor,
         batch: "TokenGateBatch",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prune prompt rows before the gate layer's MLP and prepare attention state.
-
-        On prefill, keep the selected span rows and every row outside the span.
-        Update batch's retained rows, original position IDs for those rows, and
-        attention correction buffers in place. Protected prompt scores are zero.
-        On decode, return the inputs without changing batch. Synthetic warmup
-        with no span retains every row.
+        """Prune each new prompt independently and preserve decode/replay rows.
 
         Args:
-            hidden_states: Normalized states before the gate layer's MLP,
-                shaped [num_tokens, hidden_size].
-            residual: Residual stream with the same shape and token order.
-            batch: This step's layout, with validated span options and GPU buffers
-                already allocated for the retained sequence length.
+            hidden_states: Packed normalized states before the gate MLP.
+            residual: Residual states in the same packed input order.
+            batch: Per-request lengths, options, and persistent score buffers.
 
         Returns:
-            A tuple (hidden_states, residual) with matching retained rows in
-            original order, preserving each input's dtype and device. Decode
-            returns the input tensors themselves.
+            Hidden and residual states in the packed retained layout. Persistent
+            prompt scores are updated only for requests starting or replaying.
 
         """
+        spans = []
+        for request, start in zip(batch.requests, batch.input_offsets):
+            if request.is_prefill and request.options is not None:
+                span_options = request.options
+                spans.append(
+                    hidden_states[
+                        start + span_options.span_start : start + span_options.span_end
+                    ]
+                )
+        scores = iter(
+            self.score(torch.cat(spans), [s.shape[0] for s in spans]).split(
+                [s.shape[0] for s in spans]
+            )
+            if spans
+            else ()
+        )
+        for i, request in enumerate(batch.requests):
+            start, end = batch.input_offsets[i : i + 2]
+            upper_start, upper_end = batch.output_offsets[i : i + 2]
+            options = request.options
+            device = hidden_states.device
+            if request.is_prefill and options is not None:
+                normalized = next(scores)
+                selected = self.select(normalized, options.keep_tokens)
+                indices = torch.cat(
+                    (
+                        torch.arange(options.span_start, device=device),
+                        selected + options.span_start,
+                        torch.arange(options.span_end, end - start, device=device),
+                    )
+                )
+                request.prompt_scores.zero_()
+                request.prompt_scores[
+                    options.span_start : options.span_start + options.keep_tokens
+                ].copy_(normalized.index_select(0, selected))
+            else:
+                indices = torch.arange(end - start, device=device)
+                if request.is_prefill:
+                    request.prompt_scores.zero_()
+            rows = batch.retained_rows[upper_start:upper_end]
+            rows.copy_(indices + start)
+            positions = batch.upper_positions[upper_start:upper_end]
+            positions.copy_(batch.original_positions.index_select(0, rows))
+            ratios = batch.query_ratios[upper_start:upper_end]
+            ratios.copy_(position_ratio(positions, request.compact_computed_tokens))
+            batch.query_is_prompt[upper_start:upper_end].copy_(
+                positions < request.original_prompt_length
+            )
+            if request.is_prefill:
+                request.prompt_ratios.copy_(ratios[: request.retained_prompt_length])
+        # Materialize in scheduled order once, not once per attention layer.
+        width = max(r.retained_prompt_length for r in batch.requests)
+        batch.prompt_scores = torch.stack(
+            [
+                F.pad(r.prompt_scores, (0, width - r.retained_prompt_length))
+                for r in batch.requests
+            ]
+        )
+        batch.prompt_ratios = torch.stack(
+            [
+                F.pad(r.prompt_ratios, (0, width - r.retained_prompt_length))
+                for r in batch.requests
+            ]
+        )
         if not batch.is_prefill:
             return hidden_states, residual
-        options = batch.options
-        if options is None:
-            # The one-token synthetic warmup has no prunable span.
-            indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-            normalized = hidden_states.new_empty(0, dtype=torch.float32)
-        else:
-            start, end = options.span_start, options.span_end
-            normalized = self.score(hidden_states[start:end])
-            selected = self.select(normalized, options.keep_tokens) + start
-            indices = torch.cat(
-                (
-                    torch.arange(start, device=selected.device),
-                    selected,
-                    torch.arange(end, hidden_states.shape[0], device=selected.device),
-                )
-            )
-        batch.retained_rows.copy_(indices)
-        batch.upper_positions.copy_(batch.original_positions.index_select(0, indices))
-        batch.query_ratios.copy_(position_ratio(batch.upper_positions))
-        batch.prompt_scores.zero_()
-        if options is not None:
-            begin = options.span_start
-            selected = indices[begin : begin + options.keep_tokens] - begin
-            batch.prompt_scores[begin : begin + options.keep_tokens].copy_(
-                normalized.index_select(0, selected)
-            )
-        batch.prompt_ratios.copy_(batch.query_ratios[: batch.retained_prompt_length])
         return (
-            hidden_states.index_select(0, indices),
-            residual.index_select(0, indices),
+            hidden_states.index_select(0, batch.retained_rows),
+            residual.index_select(0, batch.retained_rows),
         )
 
 
 @dataclass
-class TokenGateBatch:
-    """Track original and retained token layouts for one request's model step.
+class TokenGateSequence:
+    """Describe one scheduled request and its persistent retained-prompt state.
 
-    Prefill buffers are populated by TokenGate.compact. Prompt scores and
-    ratios are views into worker-owned storage that persists across decode
-    steps; the other tensors describe only the current step.
-
-    Attributes:
-        gate_layer: Zero-based model layer index containing the pruning gate.
-        original_prompt_length: Prompt length before pruning, excluding any
-            generated tokens replayed with the prompt.
-        retained_prompt_length: Prompt length after pruning.
-        num_computed_tokens: Previously processed tokens in the original
-            sequence; zero for initial prefill or replay from the start.
-        options: Validated prunable span and budget; None for one-token warmup.
-        original_positions: Original position IDs for this step's input rows,
-            shaped [num_input_tokens].
-        upper_positions: Original position IDs for rows after pruning, shaped
-            [num_retained_tokens]. Decode uses original_positions unchanged.
-        retained_rows: Int64 row indices into the prefill input, shaped
-            [num_retained_tokens]. Unused during decode.
-        query_ratios: FP32 position corrections for this step's retained query
-            rows, shaped [num_retained_tokens].
-        prompt_scores: FP32 scores of retained prompt tokens, shaped
-            [retained_prompt_length]; zero for tokens outside the prunable span.
-        prompt_ratios: FP32 position corrections for retained prompt tokens,
-            shaped [retained_prompt_length].
-
+    Token counts exclude other requests. Prompt channel tensors are views into
+    the worker's request-slot storage; reordering a batch does not move ownership.
     """
 
-    gate_layer: int
     original_prompt_length: int
     retained_prompt_length: int
     num_computed_tokens: int
+    num_tokens: int
     options: TokenGateRequestOptions | None
-    original_positions: torch.Tensor
-    upper_positions: torch.Tensor
-    retained_rows: torch.Tensor
-    query_ratios: torch.Tensor
     prompt_scores: torch.Tensor
     prompt_ratios: torch.Tensor
 
     @property
     def is_prefill(self) -> bool:
-        """Whether this step processes the prompt from the start, including replay."""
+        """Whether the complete prompt is being processed from its start."""
         return self.num_computed_tokens == 0
 
+    @property
+    def compact_computed_tokens(self) -> int:
+        """Number of cached tokens in the upper layers before this step."""
+        return max(0, self.num_computed_tokens - self.removed_tokens)
+
+    @property
+    def removed_tokens(self) -> int:
+        """Number of prompt tokens omitted from upper-layer history."""
+        return self.original_prompt_length - self.retained_prompt_length
+
+    @property
+    def num_retained_tokens(self) -> int:
+        """Number of query rows this request contributes after the gate."""
+        return self.num_tokens - (self.removed_tokens if self.is_prefill else 0)
+
+
+@dataclass
+class TokenGateBatch:
+    """Map packed model rows to independently pruned requests.
+
+    Input and output offsets use scheduled request order. Positions remain
+    request-local original positions, while retained_rows indexes the packed
+    input. Prompt scores/ratios are padded to the longest retained prompt with
+    zeros, so generated keys and padding never inherit another request's bias.
+    """
+
+    gate_layer: int
+    requests: list[TokenGateSequence]
+    original_positions: torch.Tensor
+    input_offsets: list[int] = field(init=False)
+    output_offsets: list[int] = field(init=False)
+    query_start_loc: torch.Tensor = field(init=False)
+    upper_positions: torch.Tensor = field(init=False)
+    retained_rows: torch.Tensor = field(init=False)
+    query_ratios: torch.Tensor = field(init=False)
+    query_is_prompt: torch.Tensor = field(init=False)
+    prompt_scores: torch.Tensor = field(init=False)
+    prompt_ratios: torch.Tensor = field(init=False)
+    uncached_prefill_start: int | None = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.input_offsets = list(
+            accumulate((r.num_tokens for r in self.requests), initial=0)
+        )
+        self.output_offsets = list(
+            accumulate((r.num_retained_tokens for r in self.requests), initial=0)
+        )
+        device = self.original_positions.device
+        count = self.output_offsets[-1]
+        self.query_start_loc = torch.tensor(
+            self.output_offsets, dtype=torch.int32, device=device
+        )
+        self.upper_positions = torch.empty(count, dtype=torch.int64, device=device)
+        self.retained_rows = torch.empty_like(self.upper_positions)
+        self.query_ratios = torch.empty(count, dtype=torch.float32, device=device)
+        self.query_is_prompt = torch.empty(count, dtype=torch.bool, device=device)
+        uncached = [
+            r.is_prefill and r.num_tokens == r.original_prompt_length
+            for r in self.requests
+        ]
+        first = next((i for i, value in enumerate(uncached) if value), None)
+        # The native runner orders decodes before prefills. Unusual layouts can
+        # still use paged attention without reordering request or cache state.
+        self.uncached_prefill_start = (
+            first if first is not None and all(uncached[first:]) else None
+        )
+
+    @property
+    def is_prefill(self) -> bool:
+        """Whether any scheduled request starts or replays a complete prompt."""
+        return any(r.is_prefill for r in self.requests)
+
     def positions_for_layer(self, layer_index: int) -> torch.Tensor:
-        """Return original position IDs for the rows a layer will process.
-
-        The gate layer's token mixer still sees all input rows. Later layers see
-        only retained rows, with their original position IDs preserved for RoPE.
-
-        Args:
-            layer_index: Zero-based model layer index, not an attention-gain row.
-
-        Returns:
-            The original_positions tensor through the gate layer, or the
-            upper_positions tensor after it; no position IDs are renumbered.
-
-        """
+        """Return original position IDs for the layer's full or retained rows."""
         return (
             self.original_positions
             if layer_index <= self.gate_layer
@@ -286,21 +352,7 @@ class TokenGateBatch:
         )
 
     def restore_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Place final prefill hidden states back at their original input rows.
-
-        This restores the row layout expected by vLLM's sampling indices. Pruned
-        rows contain zeros; the final prompt token is protected and retains its
-        computed hidden state.
-
-        Args:
-            hidden_states: Final states in retained order, shaped
-                [num_retained_tokens, hidden_size].
-
-        Returns:
-            On prefill, a tensor of shape [num_input_tokens, hidden_size] with
-            the input dtype and device. On decode, the input tensor itself.
-
-        """
+        """Restore sampler row indices, including decode rows in a mixed step."""
         if not self.is_prefill:
             return hidden_states
         result = hidden_states.new_zeros(
@@ -314,45 +366,33 @@ class TokenGateBatch:
         gate: TokenGate,
         upper_layer_index: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Adjust queries and prompt-key biases for attention after the gate.
-
-        Each query is multiplied by its position correction and a learned
-        per-head gain. Retained prompt scores supply an additive attention-logit
-        bias, weighted by the mean query gain at each prompt key's position.
-        Protected prompt keys have zero bias; generated keys have no entries
-        in this bias tensor and receive zero bias in the attention kernel.
+        """Scale packed queries and return request-local padded key biases.
 
         Args:
-            query: Queries in retained sequence order, shaped
-                [num_queries, num_heads, head_size], or with the last two
-                dimensions flattened. The dtype is the model's attention dtype.
-            gate: Loaded TokenGate parameters on the same device as query.
-            upper_layer_index: Zero-based row in the gain matrices, counting only
-                full-attention layers after the gate, not all model layers.
+            query: Retained queries [tokens, heads, head_size], optionally with
+                the last two dimensions flattened.
+            gate: Loaded parameters on the query device.
+            upper_layer_index: Gain row for this full-attention layer.
 
         Returns:
-            A tuple (scaled_query, key_bias), both in query's dtype and device.
-            scaled_query has query's shape; key_bias has shape
-            [retained_prompt_length, num_heads]. The input query is not modified.
+            Scaled queries with the input shape and a bias tensor shaped
+            [requests, max_retained_prompt, heads], both in the query dtype.
+            Generated queries retain the reference implementation's cast order.
 
         """
         dtype = query.dtype
         scale = F.softplus(gate.attn_scale[upper_layer_index])
-        # Match the TokenGate reference: prompt rows cast before multiplying;
-        # generated rows multiply in FP32 first. The rounding differs.
         prefill_scale = scale.to(dtype)[None, :] * self.query_ratios.to(dtype)[:, None]
         decode_scale = (scale[None, :] * self.query_ratios[:, None]).to(dtype)
-        # Replay can mix prompt and generated rows in the same prefill step.
         query_scale = torch.where(
-            (self.upper_positions < self.original_prompt_length)[:, None],
-            prefill_scale,
-            decode_scale,
+            self.query_is_prompt[:, None], prefill_scale, decode_scale
         )
         shaped = query.view(query.shape[0], scale.numel(), -1)
         scaled_query = (shaped * query_scale[:, :, None]).reshape_as(query)
         key_bias = (
-            self.prompt_scores[:, None] * F.softplus(gate.gate_scale[upper_layer_index])
+            self.prompt_scores[:, :, None]
+            * F.softplus(gate.gate_scale[upper_layer_index])
         ).to(dtype)
-        key_scale = scale.to(dtype)[None, :] * self.prompt_ratios.to(dtype)[:, None]
+        key_scale = scale.to(dtype) * self.prompt_ratios.to(dtype)[:, :, None]
         key_bias = key_bias * key_scale.mean(dim=-1, keepdim=True)
         return scaled_query, key_bias

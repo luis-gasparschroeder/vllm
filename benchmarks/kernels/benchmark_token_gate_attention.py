@@ -34,31 +34,45 @@ def measure(
     kv_heads: int,
     head_size: int,
     tiles: list | None = None,
+    batch_size: int = 1,
 ) -> dict:
     device, dtype, block_size = "cuda", torch.bfloat16, 16
     blocks = (sequence_length + block_size - 1) // block_size
-    query = torch.randn(query_length, heads, head_size, device=device, dtype=dtype)
+    query = torch.randn(
+        batch_size * query_length, heads, head_size, device=device, dtype=dtype
+    )
     key = torch.randn(
-        blocks, block_size, kv_heads, head_size, device=device, dtype=dtype
+        batch_size * blocks, block_size, kv_heads, head_size, device=device, dtype=dtype
     )
     value = torch.randn_like(key)
     output = torch.empty_like(query)
     # An offset view exercises the pointer alignment seen with request buffers.
-    bias = torch.randn(sequence_length * heads + 1, device=device, dtype=dtype)[1:]
-    bias = bias.view(1, sequence_length, heads)
+    bias = torch.randn(
+        batch_size * sequence_length * heads + 1, device=device, dtype=dtype
+    )[1:].view(batch_size, sequence_length, heads)
+    query_offsets = (
+        torch.arange(batch_size + 1, device=device, dtype=torch.int32) * query_length
+    )
+    key_offsets = (
+        torch.arange(batch_size + 1, device=device, dtype=torch.int32) * sequence_length
+    )
     kwargs = dict(
         q=query,
         k=key,
         v=value,
         out=output,
-        cu_seqlens_q=torch.tensor([0, query_length], device=device, dtype=torch.int32),
+        cu_seqlens_q=query_offsets,
         max_seqlen_q=query_length,
-        seqused_k=torch.tensor([sequence_length], device=device, dtype=torch.int32),
+        seqused_k=torch.full(
+            (batch_size,), sequence_length, device=device, dtype=torch.int32
+        ),
         max_seqlen_k=sequence_length,
         softmax_scale=head_size**-0.5,
         causal=True,
         window_size=(-1, -1),
-        block_table=torch.arange(blocks, device=device, dtype=torch.int32)[None],
+        block_table=torch.arange(
+            batch_size * blocks, device=device, dtype=torch.int32
+        ).view(batch_size, blocks),
         softcap=0.0,
         q_descale=None,
         k_descale=None,
@@ -66,24 +80,48 @@ def measure(
         seq_threshold_3D=8,
         num_par_softmax_segments=16,
         softmax_segm_output=torch.empty(
-            query_length, heads, 16, triton.next_power_of_2(head_size), device=device
+            batch_size * query_length,
+            heads,
+            16,
+            triton.next_power_of_2(head_size),
+            device=device,
         ),
-        softmax_segm_max=torch.empty(query_length, heads, 16, device=device),
-        softmax_segm_expsum=torch.empty(query_length, heads, 16, device=device),
+        softmax_segm_max=torch.empty(
+            batch_size * query_length, heads, 16, device=device
+        ),
+        softmax_segm_expsum=torch.empty(
+            batch_size * query_length, heads, 16, device=device
+        ),
     )
     rows = torch.tensor(sorted({0, query_length // 2, query_length - 1}), device=device)
-    dense_key = key.flatten(0, 1)[:sequence_length].repeat_interleave(
-        heads // kv_heads, 1
+    direct_key = (
+        key.view(batch_size, blocks * block_size, kv_heads, head_size)[
+            :, :sequence_length
+        ]
+        .reshape(batch_size * sequence_length, kv_heads, head_size)
+        .contiguous()
     )
-    dense_value = value.flatten(0, 1)[:sequence_length].repeat_interleave(
-        heads // kv_heads, 1
+    direct_value = (
+        value.view(batch_size, blocks * block_size, kv_heads, head_size)[
+            :, :sequence_length
+        ]
+        .reshape(batch_size * sequence_length, kv_heads, head_size)
+        .contiguous()
     )
-    scores = torch.einsum("qhd,khd->hqk", query[rows].float(), dense_key.float())
+    dense_key = direct_key.view(batch_size, sequence_length, kv_heads, head_size)
+    dense_key = dense_key.repeat_interleave(heads // kv_heads, 2)
+    dense_value = direct_value.view(batch_size, sequence_length, kv_heads, head_size)
+    dense_value = dense_value.repeat_interleave(heads // kv_heads, 2)
+    sampled_rows = rows[None] + query_offsets[:-1, None]
+    scores = torch.einsum(
+        "bqhd,bkhd->bhqk", query[sampled_rows].float(), dense_key.float()
+    )
     scores *= head_size**-0.5
     causal = torch.arange(sequence_length, device=device)[None] <= (
         sequence_length - query_length + rows[:, None]
     )
     result = dict(
+        batch_size=batch_size,
         query_length=query_length,
         sequence_length=sequence_length,
         heads=heads,
@@ -92,9 +130,7 @@ def measure(
     )
     variants = [("ordinary", None, None), ("prompt_bias", bias, None)]
     if query_length == sequence_length:
-        direct_key = key.flatten(0, 1)[:sequence_length]
-        direct_value = value.flatten(0, 1)[:sequence_length]
-        packed_bias = bias[0].T.contiguous().T
+        packed_bias = bias.transpose(1, 2).contiguous().transpose(1, 2)
         result["flash_attention_version"] = get_flash_attn_version(head_size=head_size)
         variants.append(("flash_attention", None, None))
         variants.append(("tiled_bias", packed_bias, None))
@@ -113,6 +149,8 @@ def measure(
                     output,
                     head_size**-0.5,
                     tile=tile,
+                    query_start_loc=query_offsets,
+                    max_query_len=query_length,
                 )
             elif label == "flash_attention":
                 flash_attn_varlen_func(
@@ -122,7 +160,7 @@ def measure(
                     query_length,
                     kwargs["cu_seqlens_q"],
                     sequence_length,
-                    kwargs["cu_seqlens_q"],
+                    key_offsets,
                     softmax_scale=head_size**-0.5,
                     causal=True,
                     fa_version=result["flash_attention_version"],
@@ -138,11 +176,13 @@ def measure(
         result[label + "_first_call_seconds"] = time.perf_counter() - start
         expected_scores = scores.clone()
         if key_bias is not None:
-            expected_scores += bias[0].T[:, None].float()
-        expected_scores.masked_fill_(~causal[None], -float("inf"))
+            expected_scores += bias.transpose(1, 2)[:, :, None].float()
+        expected_scores.masked_fill_(~causal[None, None], -float("inf"))
         probabilities = expected_scores.softmax(-1).to(dtype)
-        expected = torch.einsum("hqk,khd->qhd", probabilities, dense_value)
-        torch.testing.assert_close(output[rows], expected, atol=1.5e-2, rtol=1.5e-2)
+        expected = torch.einsum("bhqk,bkhd->bqhd", probabilities, dense_value)
+        torch.testing.assert_close(
+            output[sampled_rows], expected, atol=1.5e-2, rtol=1.5e-2
+        )
         for _ in range(25):
             run()
         timings = sorted(
@@ -158,13 +198,16 @@ def measure(
         result[label + "_microseconds"] = milliseconds * 1000
         # Two matrix products over the causal query/key pairs; excludes softmax.
         pairs = query_length * sequence_length - query_length * (query_length - 1) / 2
-        result[label + "_tflops"] = 4 * heads * head_size * pairs / (milliseconds * 1e9)
+        result[label + "_tflops"] = (
+            4 * batch_size * heads * head_size * pairs / (milliseconds * 1e9)
+        )
     return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1])
     parser.add_argument(
         "--shape",
         type=int,
@@ -197,8 +240,8 @@ def main() -> None:
             "head counts and dimensions must be positive; "
             "heads must be divisible by KV heads"
         )
-    if min(args.sequence_lengths + args.query_lengths) < 1:
-        parser.error("sequence and query lengths must be positive")
+    if min(args.sequence_lengths + args.query_lengths + args.batch_sizes) < 1:
+        parser.error("batch sizes and sequence/query lengths must be positive")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.output.exists():
         parser.error(
@@ -215,20 +258,27 @@ def main() -> None:
         timing="CUPTI, CUDA graph, cold L2; production launch heuristic",
         cases=[],
     )
-    for heads, kv_heads, size in shapes:
-        for sequence_length in args.sequence_lengths:
-            queries = set(args.query_lengths)
-            if args.full_prefill:
-                queries.add(sequence_length)
-            for query_length in sorted(queries):
-                if query_length > sequence_length:
-                    continue
-                row = measure(
-                    query_length, sequence_length, heads, kv_heads, size, args.tile
-                )
-                result["cases"].append(row)
-                print(json.dumps(row), flush=True)
-                args.output.write_text(json.dumps(result, indent=2))
+    for batch_size in args.batch_sizes:
+        for heads, kv_heads, size in shapes:
+            for sequence_length in args.sequence_lengths:
+                queries = set(args.query_lengths)
+                if args.full_prefill:
+                    queries.add(sequence_length)
+                for query_length in sorted(queries):
+                    if query_length > sequence_length:
+                        continue
+                    row = measure(
+                        query_length,
+                        sequence_length,
+                        heads,
+                        kv_heads,
+                        size,
+                        args.tile,
+                        batch_size,
+                    )
+                    result["cases"].append(row)
+                    print(json.dumps(row), flush=True)
+                    args.output.write_text(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

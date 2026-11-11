@@ -107,7 +107,23 @@ the shared-memory budget.
 The tiled path supports head dimensions up to 256 with ordinary causal attention;
 other shapes or attention modifiers use the paged path. Decode and replay
 containing generated tokens also use paged attention. Launch geometry depends
-only on tensor shape
+only on tensor shape.
+
+Packed batches carry cumulative offsets for the original and retained layouts.
+Scoring projections share a batched call, while normalization and top-K selection
+stay within each request's span. Persistent score and position-ratio buffers are
+indexed by request slot, not by the request's current row in the scheduled batch.
+The native block-table mapper computes cache-write locations for both layouts.
+
+Mixed steps keep the runner's decode-before-prefill order: cached requests use
+the paged kernel, and the uncached prompt suffix uses tiled prefill. Both write
+their original output slices. An interleaved request layout falls back to paged
+attention rather than reordering request or cache state.
+
+The tiled kernel adds a request grid dimension and loads sequence boundaries
+from cumulative offsets. Attention never crosses a request boundary. Paged
+attention receives a request-major bias tensor padded with zeros beyond each
+retained prompt, including generated keys shorter than another request's prompt.
 
 ### Qwen3.5 full-attention layers
 

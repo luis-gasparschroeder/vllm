@@ -10,7 +10,7 @@ The adjustments apply during prompt processing and answer generation; newly
 generated keys receive no score-based bias.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -28,6 +28,39 @@ class TokenGateAttentionMetadata(TritonAttentionMetadata):
     batch: TokenGateBatch | None = None
     gate: TokenGate | None = None
     upper_layer_index: int = 0
+    prefill_query_start_loc: torch.Tensor | None = field(init=False, default=None)
+    paged_metadata: TritonAttentionMetadata | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        """Prepare views for a cached prefix and an uncached prefill suffix.
+
+        Request and token order are unchanged. Preparing offsets here avoids
+        rebuilding them in every attention-layer forward pass.
+        """
+        if self.batch is None or self.batch.uncached_prefill_start is None:
+            return
+        first = self.batch.uncached_prefill_start
+        tokens = self.batch.output_offsets[first]
+        self.prefill_query_start_loc = self.query_start_loc[first:] - tokens
+        if first:
+            requests = self.batch.requests[:first]
+            self.paged_metadata = TritonAttentionMetadata(
+                num_actual_tokens=tokens,
+                max_query_len=max(r.num_retained_tokens for r in requests),
+                query_start_loc=self.query_start_loc[: first + 1],
+                max_seq_len=max(
+                    r.compact_computed_tokens + r.num_retained_tokens for r in requests
+                ),
+                seq_lens=self.seq_lens[:first],
+                block_table=self.block_table[:first],
+                slot_mapping=self.slot_mapping[:tokens],
+                seq_threshold_3D=self.seq_threshold_3D,
+                num_par_softmax_segments=self.num_par_softmax_segments,
+                softmax_segm_output=self.softmax_segm_output,
+                softmax_segm_max=self.softmax_segm_max,
+                softmax_segm_expsum=self.softmax_segm_expsum,
+                causal=self.causal,
+            )
 
 
 class TokenGateAttentionBackend(TritonAttentionBackend):
@@ -81,16 +114,37 @@ class TokenGateAttentionImpl(TritonAttentionImpl):
             and attn_metadata.mm_prefix_range_tensor is None
             and output_scale is None
             and output_block_scale is None
-            and attn_metadata.batch.is_prefill
-            and query.shape[0] == attn_metadata.batch.retained_prompt_length
+            and attn_metadata.prefill_query_start_loc is not None
         ):
             from vllm.v1.attention.ops.token_gate_attention import token_gate_prefill
 
             # Adjacent keys within a head share cache lines. No values change.
-            bias = bias.T.contiguous().T
-            token_gate_prefill(query, key, value, bias, output, self.scale)
+            first = attn_metadata.batch.uncached_prefill_start
+            assert first is not None
+            tokens = attn_metadata.batch.output_offsets[first]
+            prefill_bias = bias[first:].transpose(1, 2).contiguous().transpose(1, 2)
+            token_gate_prefill(
+                query[tokens:],
+                key[tokens:],
+                value[tokens:],
+                prefill_bias,
+                output[tokens:],
+                self.scale,
+                query_start_loc=attn_metadata.prefill_query_start_loc,
+                max_query_len=attn_metadata.max_query_len,
+            )
+            if attn_metadata.paged_metadata is not None:
+                super().forward(
+                    layer,
+                    query[:tokens],
+                    key[:tokens],
+                    value[:tokens],
+                    kv_cache,
+                    replace(attn_metadata.paged_metadata, key_bias=bias[:first]),
+                    output[:tokens],
+                )
             return output
-        metadata = replace(attn_metadata, key_bias=bias.unsqueeze(0))
+        metadata = replace(attn_metadata, key_bias=bias)
         return super().forward(
             layer,
             query,

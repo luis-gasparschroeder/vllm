@@ -47,8 +47,16 @@ def snapshot_recurrent_state(worker):
 @pytest.mark.parametrize("hybrid,gate_layer", [(False, 0), (True, 1), (True, 3)])
 @pytest.mark.parametrize("backend", [None, "TRITON_ATTN"])
 @pytest.mark.parametrize("prefill_backend", ["triton", "tiled"])
+@pytest.mark.parametrize("max_num_seqs", [1, 3])
 def test_public_generation_matches_dense_reference(
-    vllm_runner, tmp_path, monkeypatch, backend, hybrid, gate_layer, prefill_backend
+    vllm_runner,
+    tmp_path,
+    monkeypatch,
+    backend,
+    hybrid,
+    gate_layer,
+    prefill_backend,
+    max_num_seqs,
 ):
     # Advance exactly one engine step at a time so reset/abort precedes completion.
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -69,7 +77,7 @@ def test_public_generation_matches_dense_reference(
     gate = torch.load(artifacts["gate_path"], weights_only=True)
     prompts = [
         list(range(4, 28)),
-        list(range(8, 32)),
+        list(range(8, 37)),
         list(range(4, 28)),
         list(range(4, 28)),
     ]
@@ -98,8 +106,8 @@ def test_public_generation_matches_dense_reference(
         dtype="bfloat16",
         enforce_eager=True,
         max_model_len=64,
-        max_num_seqs=1,
-        max_num_batched_tokens=64,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=64 * max_num_seqs,
         enable_chunked_prefill=False,
         enable_prefix_caching=False,
         async_scheduling=False,
@@ -182,6 +190,56 @@ def test_public_generation_matches_dense_reference(
             atol=2e-2,
             rtol=2e-2,
         )
+
+        if max_num_seqs > 1:
+            survivor = params[0].clone()
+            survivor.max_tokens = 6
+            survivor.output_kind = RequestOutputKind.CUMULATIVE
+            engine.add_request("survivor", {"prompt_token_ids": prompts[0]}, survivor)
+            assert not engine.step()[0].finished
+            engine.add_request("cancel", {"prompt_token_ids": prompts[1]}, params[1])
+            engine.add_request("new", {"prompt_token_ids": prompts[3]}, params[3])
+            engine.step()
+
+            def scheduled_layout(worker):
+                return [
+                    (r.is_prefill, r.num_tokens, r.num_retained_tokens)
+                    for r in worker.model_runner.model_state.history.batch.requests
+                ]
+
+            layout = runner.llm.collective_rpc(scheduled_layout)[0]
+            assert len(layout) == 3
+            assert sorted(prefill for prefill, _, _ in layout) == [False, True, True]
+            engine.abort_request(["cancel"])
+            finished = {}
+            while engine.has_unfinished_requests():
+                for result in engine.step():
+                    if result.finished:
+                        finished[result.request_id] = result
+            assert set(finished) == {"survivor", "new"}
+            # Reuse an aborted slot and replay two requests with generated history.
+            for name, index in (("replay-a", 0), ("replay-b", 1)):
+                engine.add_request(
+                    name, {"prompt_token_ids": prompts[index]}, params[index]
+                )
+            engine.step()
+            engine.step()
+            assert runner.llm.reset_prefix_cache(reset_running_requests=True)
+            while engine.has_unfinished_requests():
+                for result in engine.step():
+                    if result.finished:
+                        finished[result.request_id] = result
+            assert set(finished) == {"survivor", "new", "replay-a", "replay-b"}
+            for name, index in (
+                ("survivor", 0),
+                ("new", 3),
+                ("replay-a", 0),
+                ("replay-b", 1),
+            ):
+                results.append(finished[name])
+                prompts.append(prompts[index])
+                spans.append(spans[index])
+                budgets.append(budgets[index])
 
     # Compare distributions for the same history. BF16 can break an exact HF
     # argmax tie differently, so independent greedy rollouts are not an oracle

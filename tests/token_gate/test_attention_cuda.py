@@ -15,6 +15,75 @@ import torch
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
 
+@pytest.mark.parametrize("size,kv_heads", [(64, 2), (96, 1), (256, 4)])
+@pytest.mark.parametrize("lengths", [(1, 17, 129), (65, 513, 3)])
+def test_packed_prefill_isolates_unequal_requests(size, kv_heads, lengths):
+    from vllm.v1.attention.ops.token_gate_attention import token_gate_prefill
+
+    torch.manual_seed(19)
+    heads = 4
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    qkv = torch.randn(
+        offsets[-1],
+        heads + 2 * kv_heads,
+        size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    query, key, value = qkv.split([heads, kv_heads, kv_heads], dim=1)
+    bias = torch.zeros(
+        len(lengths), heads, max(lengths), device="cuda", dtype=query.dtype
+    ).transpose(1, 2)
+    for i, length in enumerate(lengths):
+        bias[i, : max(0, length - 3)].normal_()
+    output = torch.empty_like(query)
+    starts = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    token_gate_prefill(
+        query,
+        key,
+        value,
+        bias,
+        output,
+        size**-0.5,
+        query_start_loc=starts,
+        max_query_len=max(lengths),
+    )
+    for i, length in enumerate(lengths):
+        start, end = offsets[i : i + 2]
+        dense_key = key[start:end].repeat_interleave(heads // kv_heads, dim=1)
+        dense_value = value[start:end].repeat_interleave(heads // kv_heads, dim=1)
+        scores = (
+            torch.einsum("qhd,khd->hqk", query[start:end].float(), dense_key.float())
+            / size**0.5
+        )
+        scores += bias[i, :length].T[:, None].float()
+        causal = torch.ones(length, length, device="cuda", dtype=torch.bool).tril()
+        scores.masked_fill_(~causal[None], float("-inf"))
+        expected = torch.einsum(
+            "hqk,khd->qhd", scores.softmax(-1).to(query.dtype), dense_value
+        )
+        torch.testing.assert_close(
+            output[start:end], expected, atol=1.5e-2, rtol=1.5e-2
+        )
+    # Changing a neighboring request must not affect the first request at all.
+    unchanged = output[: lengths[0]].clone()
+    qkv[lengths[0] :].mul_(7)
+    bias[1:].add_(3)
+    token_gate_prefill(
+        query,
+        key,
+        value,
+        bias,
+        output,
+        size**-0.5,
+        query_start_loc=starts,
+        max_query_len=max(lengths),
+    )
+    torch.testing.assert_close(output[: lengths[0]], unchanged, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "heads,kv_heads,size",
     [(4, 2, 64), (4, 4, 64), (4, 1, 96), (16, 8, 128), (4, 1, 192), (8, 2, 256)],

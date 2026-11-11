@@ -199,6 +199,21 @@ TokenGate checkpoints require these fields on every request; ordinary
 checkpoints reject them. Response usage counts the **original** prompt length.
 Output streaming is supported.
 
+### Batching
+
+Set `max_num_seqs` to the desired maximum number of active requests. Submit a
+list of pretokenized prompts with corresponding `SamplingParams` to `LLM.generate`,
+or use `AsyncLLM.generate` to admit new requests as others finish. Each request
+has its own span and retained-token budget; prompt lengths and budgets may differ.
+For complete prefills to run together, both `max_num_batched_tokens` and
+`max_num_scheduled_tokens` must accommodate their combined token count. Otherwise
+the scheduler defers prompts that do not fit; it does not partially prune them.
+
+The tiled backend handles packed, unequal-length complete prefills, including
+new prompts in mixed prefill/decode steps. Cached requests and replay continue
+to use paged attention. Asynchronous request
+submission is supported with `async_scheduling=False`.
+
 ## Limitations
 
 The integration is experimental. Unsupported engine settings fail at startup;
@@ -206,7 +221,7 @@ invalid request options are rejected before execution.
 
 | Area | Currently unsupported |
 | --- | --- |
-| Scheduling and execution | Chunked prefill, concurrent active requests, asynchronous scheduling, compilation, CUDA graphs, speculative decoding, and parallel execution. |
+| Scheduling and execution | Chunked prefill, asynchronous scheduling, compilation, CUDA graphs, speculative decoding, and parallel execution. |
 | Cache and weights | Prefix caching, KV sharing, cache transfer, cache or weight offload, quantization, and dynamic adapters. |
 | Inputs | Text or chat requests, streaming input, multimodal input, and prompt embeddings. Submit pretokenized completions instead. |
 | Prompt transformations | Truncation, padding, completion suffixes, or insertion of special tokens after span alignment. |
@@ -214,7 +229,7 @@ invalid request options are rejected before execution.
 | Model variants | MoE, sliding or retrospective sliding-window attention, dual-chunk attention, decoder layer scaling, and HiSparse. |
 
 These limits reflect the current implementation. It selects tokens from a
-complete prompt, manages one active request's full and retained histories, and
+complete prompt, manages each request's full and retained histories independently, and
 requires token positions to remain unchanged after alignment. Extending those
 assumptions needs additional implementation and testing. Qwen3.5 pruning reduces
 recurrent prefill work, but its recurrent-state dimensions remain fixed.

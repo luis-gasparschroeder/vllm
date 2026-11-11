@@ -31,7 +31,7 @@ def _fused_gdn_gated_rms_norm_kernel(
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
     head = tl.program_id(1)
 
-    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    rows = (row_start + tl.arange(0, ROWS_PER_BLOCK)).to(tl.int64)
     cols = tl.arange(0, BLOCK_N)
     row_mask = rows[:, None] < M
     col_mask = cols[None, :] < N

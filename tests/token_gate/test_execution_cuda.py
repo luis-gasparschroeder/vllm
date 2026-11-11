@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Check that vLLM rejects serving settings this TokenGate implementation cannot use.
 
-Token filtering currently requires the entire prompt in one execution step
-and one active request at a time. These tests resolve real engine configurations
+Token filtering requires each entire prompt in one execution step.
+These tests resolve real engine configurations
 for small Qwen3 and text-only Qwen3.5 models on CUDA, checking both valid settings
 and rejection of incompatible token limits, chunked prompt processing, prefix
 caching, or asynchronous scheduling.
@@ -35,7 +35,6 @@ def checkpoint(tmp_path_factory, request):
         ({"enable_prefix_caching": True}, "prefix caching"),
         ({"enable_chunked_prefill": True}, "chunked prefill"),
         ({"async_scheduling": True}, "async scheduling"),
-        ({"max_num_seqs": 2}, "multiple active requests"),
     ],
 )
 def test_resolved_config_rejects_unsupported_execution(checkpoint, overrides, message):
@@ -46,7 +45,7 @@ def test_resolved_config_rejects_unsupported_execution(checkpoint, overrides, me
         max_model_len=64,
         max_num_batched_tokens=64,
         max_num_scheduled_tokens=64,
-        max_num_seqs=1,
+        max_num_seqs=3,
         enable_chunked_prefill=False,
         enable_prefix_caching=False,
         async_scheduling=False,

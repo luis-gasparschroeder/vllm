@@ -25,13 +25,13 @@ from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
-def make_request():
+def make_request(request_id="doc", prompt_length=33, retained_length=9):
     return Request(
-        "doc",
-        list(range(33)),
+        request_id,
+        list(range(prompt_length)),
         SamplingParams(max_tokens=8),
         pooling_params=None,
-        cache_sequence_layout=CacheSequenceLayout(33, 9),
+        cache_sequence_layout=CacheSequenceLayout(prompt_length, retained_length),
     )
 
 
@@ -94,6 +94,35 @@ def test_decode_growth_and_replay_free_both_histories():
 def test_partial_prompt_cannot_allocate_a_compact_history():
     with pytest.raises(ValueError, match="complete prompt"):
         make_manager().allocate_slots(make_request(), 16)
+
+
+def test_free_and_replay_leave_other_requests_blocks_unchanged():
+    manager = make_manager()
+    first = make_request("first")
+    survivor = make_request("survivor", 48, 17)
+    assert manager.allocate_slots(first, 33) is not None
+    assert manager.allocate_slots(survivor, 48) is not None
+    before = [
+        [block.block_id for block in group]
+        for group in manager.get_blocks("survivor").blocks
+    ]
+    assert list(map(len, before)) == [3, 2]
+    manager.free(first)
+    assert manager.allocate_slots(first, 33, full_sequence_must_fit=True) is not None
+    after = [
+        [block.block_id for block in group]
+        for group in manager.get_blocks("survivor").blocks
+    ]
+    assert before == after
+    first_blocks = {
+        block.block_id
+        for group in manager.get_blocks("first").blocks
+        for block in group
+    }
+    assert not first_blocks.intersection(block for group in after for block in group)
+    manager.free(first)
+    manager.free(survivor)
+    assert manager.block_pool.get_num_free_blocks() == 19
 
 
 def test_hybrid_allocates_fixed_state_blocks_and_releases_both_histories():

@@ -19,13 +19,13 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.token_gate import TokenGateConfig
-from vllm.model_executor.layers.token_gate import TokenGateBatch, position_ratio
+from vllm.model_executor.layers.token_gate import TokenGateBatch, TokenGateSequence
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.token_gate import TokenGateRequestOptions
 from vllm.v1.attention.backends.token_gate import TokenGateAttentionMetadata
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -96,66 +96,64 @@ class TokenGateHistory:
         synthetic: bool = False,
         skip_attention: bool = False,
     ) -> None:
-        if input_batch.num_reqs != 1:
-            raise ValueError("TokenGate requires one active request")
         self.profile_workspace = None
-        tokens = input_batch.num_tokens
+        requests = []
+        positions = input_batch.positions[: input_batch.num_tokens]
         if synthetic:
-            prompt_length = tokens
-            options = (
-                TokenGateRequestOptions(0, tokens - 1, tokens - 1)
-                if tokens > 1
-                else None
+            positions = torch.cat(
+                [
+                    torch.arange(int(length), device=self.device)
+                    for length in input_batch.num_scheduled_tokens
+                ]
             )
-            computed = 0
-            channels = torch.zeros((2, tokens), device=self.device)
-            positions = torch.arange(tokens, device=self.device)
-            if skip_attention:
-                # Account for scaled Q, key bias, and FP32/BF16 scale temporaries
-                # that real paged attention allocates, without touching its caches.
-                config = self.model_config.hf_text_config
-                heads = config.num_attention_heads
-                head_size = self.model_config.get_head_size()
-                workspace_bytes = tokens * heads * (2 * head_size + 24)
-                self.profile_workspace = torch.empty(
-                    workspace_bytes, dtype=torch.uint8, device=self.device
+        for i, length in enumerate(input_batch.num_scheduled_tokens):
+            tokens = int(length)
+            if synthetic:
+                prompt_length, computed = tokens, 0
+                options = (
+                    TokenGateRequestOptions(0, tokens - 1, tokens - 1)
+                    if tokens > 1
+                    else None
                 )
-        else:
-            state = self.requests[input_batch.req_ids[0]]
-            prompt_length, options = state.prompt_length, state.options
-            computed = int(input_batch.num_computed_tokens_np[0])
-            channels = self.prompt_channels[:, state.slot]
-            positions = input_batch.positions[:tokens]
-            if computed == 0 and tokens < prompt_length:
-                raise ValueError("TokenGate cannot execute a partial prompt")
-            if 0 < computed < prompt_length:
-                raise ValueError("TokenGate cannot resume a partial prompt")
-        removed = options.removed_tokens if options is not None else 0
-        retained_prompt = prompt_length - removed
-        retained_queries = tokens - removed if computed == 0 else tokens
-        upper_positions = (
-            torch.empty(retained_queries, device=self.device, dtype=torch.int64)
-            if computed == 0
-            else positions
-        )
-        ratios = (
-            torch.empty(retained_queries, device=self.device, dtype=torch.float32)
-            if computed == 0
-            else position_ratio(positions, computed - removed)
-        )
-        self.batch = TokenGateBatch(
-            self.gate_layer,
-            prompt_length,
-            retained_prompt,
-            computed,
-            options,
-            positions,
-            upper_positions,
-            torch.empty(retained_queries, device=self.device, dtype=torch.int64),
-            ratios,
-            channels[0, :retained_prompt],
-            channels[1, :retained_prompt],
-        )
+                channels = torch.zeros((2, tokens), device=self.device)
+            else:
+                state = self.requests[input_batch.req_ids[i]]
+                if state.slot != int(input_batch.idx_mapping_np[i]):
+                    raise ValueError(
+                        "TokenGate request slot does not match the scheduled row"
+                    )
+                prompt_length, options = state.prompt_length, state.options
+                computed = int(input_batch.num_computed_tokens_np[i])
+                channels = self.prompt_channels[:, state.slot]
+                if computed == 0 and tokens < prompt_length:
+                    raise ValueError("TokenGate cannot execute a partial prompt")
+                if 0 < computed < prompt_length:
+                    raise ValueError("TokenGate cannot resume a partial prompt")
+            removed = options.removed_tokens if options is not None else 0
+            retained_prompt = prompt_length - removed
+            requests.append(
+                TokenGateSequence(
+                    prompt_length,
+                    retained_prompt,
+                    computed,
+                    tokens,
+                    options,
+                    channels[0, :retained_prompt],
+                    channels[1, :retained_prompt],
+                )
+            )
+        self.batch = TokenGateBatch(self.gate_layer, requests, positions)
+        if skip_attention:
+            config = self.model_config.hf_text_config
+            heads = config.num_attention_heads
+            size = self.model_config.get_head_size()
+            tokens = self.batch.upper_positions.numel()
+            prefix = len(requests) * max(r.retained_prompt_length for r in requests)
+            # Scaled queries plus FP32/BF16 query scales, key scales, and biases.
+            workspace_bytes = heads * (tokens * (2 * size + 12) + prefix * 12)
+            self.profile_workspace = torch.empty(
+                workspace_bytes, dtype=torch.uint8, device=self.device
+            )
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
@@ -174,30 +172,34 @@ class TokenGateHistory:
         kv_cache_config: KVCacheConfig,
     ) -> torch.Tensor:
         assert self.batch is not None
-        mappings = tables.slot_mappings[:, : input_batch.num_tokens_after_padding]
-        mappings.fill_(-1)
-        removed = self.batch.original_prompt_length - self.batch.retained_prompt_length
+        full = tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            self.batch.original_positions,
+            input_batch.num_tokens_after_padding,
+        )
+        # The second call must not overwrite full-history mappings.
+        compact_positions = torch.cat(
+            [
+                torch.arange(
+                    r.compact_computed_tokens,
+                    r.compact_computed_tokens + r.num_retained_tokens,
+                    device=self.device,
+                )
+                for r in self.batch.requests
+            ]
+        )
+        compact = tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            self.batch.query_start_loc,
+            compact_positions,
+            input_batch.num_tokens_after_padding,
+            out=torch.empty_like(tables.slot_mappings),
+        )
         for i, group in enumerate(kv_cache_config.kv_cache_groups):
-            spec = group.kv_cache_spec
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                spec = spec.first_spec
-            if isinstance(spec, MambaSpec):
-                continue
-            count = (
-                self.batch.upper_positions.numel()
-                if group.uses_compact_sequence
-                else input_batch.num_tokens
-            )
-            start = self.batch.num_computed_tokens
-            if group.uses_compact_sequence and start:
-                start -= removed
-            positions = torch.arange(start, start + count, device=self.device)
-            block_size = group.kv_cache_spec.block_size
-            blocks = block_tables[i][0].index_select(0, positions // block_size)
-            mappings[i, :count].copy_(
-                blocks.long() * block_size + positions % block_size
-            )
-        return mappings
+            if group.uses_compact_sequence:
+                full[i].copy_(compact[i])
+        return full
 
     def slot_mappings_by_layer(
         self,
@@ -243,48 +245,50 @@ class TokenGateHistory:
             batch = replace(
                 input_batch,
                 num_tokens_after_padding=input_batch.num_tokens,
-                is_prefilling_np=np.array([self.batch.is_prefill]),
+                is_prefilling_np=np.array([r.is_prefill for r in self.batch.requests]),
                 has_prefill=self.batch.is_prefill,
                 decode_graph_eligible=not self.batch.is_prefill,
                 prefill_runs_as_decode_np=None,
             )
             if compact:
-                queries = self.batch.upper_positions.numel()
-                removed = (
-                    self.batch.original_prompt_length
-                    - self.batch.retained_prompt_length
+                requests = self.batch.requests
+                lengths = np.array(
+                    [r.num_retained_tokens for r in requests], dtype=np.int32
                 )
-                computed = max(0, self.batch.num_computed_tokens - removed)
-                seq_len = computed + queries
-                query_locs = np.array([0, queries], dtype=np.int32)
+                computed = np.array(
+                    [r.compact_computed_tokens for r in requests], dtype=np.int32
+                )
+                prompts = np.array(
+                    [r.retained_prompt_length for r in requests], dtype=np.int32
+                )
+                seq_lens = computed + lengths
+                queries = int(lengths.sum())
                 batch = replace(
                     batch,
                     num_tokens=queries,
                     num_tokens_after_padding=queries,
-                    query_start_loc=torch.tensor(
-                        [0, queries], dtype=torch.int32, device=self.device
+                    query_start_loc=self.batch.query_start_loc,
+                    query_start_loc_np=np.array(
+                        self.batch.output_offsets, dtype=np.int32
                     ),
-                    query_start_loc_np=query_locs,
-                    max_query_len=queries,
-                    num_scheduled_tokens=np.array([queries], dtype=np.int32),
+                    max_query_len=int(lengths.max()),
+                    num_scheduled_tokens=lengths,
                     seq_lens=torch.tensor(
-                        [seq_len], dtype=torch.int32, device=self.device
+                        seq_lens, dtype=torch.int32, device=self.device
                     ),
-                    seq_lens_cpu_upper_bound=torch.tensor([seq_len], dtype=torch.int32),
+                    seq_lens_cpu_upper_bound=torch.from_numpy(seq_lens),
                     positions=self.batch.upper_positions,
-                    num_computed_tokens_np=np.array([computed], dtype=np.int32),
-                    prefill_len_np=np.array(
-                        [self.batch.retained_prompt_length], dtype=np.int32
-                    ),
-                    num_computed_prefill_tokens_np=np.array(
-                        [min(computed, self.batch.retained_prompt_length)],
-                        dtype=np.int32,
-                    ),
+                    num_computed_tokens_np=computed,
+                    prefill_len_np=prompts,
+                    num_computed_prefill_tokens_np=np.minimum(computed, prompts),
+                    max_seq_len_np=seq_lens
+                    if input_batch.max_seq_len_np is not None
+                    else None,
                     prompt_lens=(
                         None
                         if input_batch.prompt_lens is None
                         else torch.tensor(
-                            [self.batch.retained_prompt_length],
+                            prompts,
                             dtype=input_batch.prompt_lens.dtype,
                             device=self.device,
                         )

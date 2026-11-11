@@ -20,6 +20,7 @@ def _token_gate_prefill(
     V,
     Bias,
     Output,
+    QueryStart,
     q_stride_n: tl.constexpr,
     q_stride_h: tl.constexpr,
     k_stride_n: tl.constexpr,
@@ -28,10 +29,12 @@ def _token_gate_prefill(
     v_stride_h: tl.constexpr,
     bias_stride_n: tl.constexpr,
     bias_stride_h,
+    bias_stride_seq: tl.constexpr,
     o_stride_n: tl.constexpr,
     o_stride_h: tl.constexpr,
     length,
     bias_length,
+    VARLEN: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     SCALE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
@@ -41,6 +44,17 @@ def _token_gate_prefill(
 ):
     block = tl.program_id(0)
     head = tl.program_id(1).to(tl.int64)
+    if VARLEN:
+        request = tl.program_id(2)
+        begin = tl.load(QueryStart + request).to(tl.int64)
+        length = tl.load(QueryStart + request + 1) - begin
+        Q += begin * q_stride_n
+        K += begin * k_stride_n
+        V += begin * v_stride_n
+        Output += begin * o_stride_n
+        Bias += request.to(tl.int64) * bias_stride_seq
+    if block * BLOCK_M >= length:
+        return
     kv_head = head // GROUP_SIZE
     rows = block * BLOCK_M + tl.arange(0, BLOCK_M)
     columns = tl.arange(0, BLOCK_N)
@@ -123,6 +137,8 @@ def token_gate_prefill(
     output: torch.Tensor,
     scale: float,
     *,
+    query_start_loc: torch.Tensor | None = None,
+    max_query_len: int | None = None,
     tile: tuple[int, int, int, int] | None = None,
 ) -> None:
     """Write full-sequence causal attention with TokenGate's prompt-key bias.
@@ -131,10 +147,15 @@ def token_gate_prefill(
         query: Scaled queries [tokens, query_heads, head_size], in BF16.
         key: Keys [tokens, kv_heads, head_size], in query's dtype.
         value: Values with key's shape and dtype.
-        key_bias: Bias [prompt_tokens, query_heads], in query's dtype.
+        key_bias: Bias [requests, max_prompt_tokens, query_heads] for packed
+            sequences, or [prompt_tokens, query_heads] for a single sequence.
             Later keys receive zero bias. Arbitrary strides are supported.
         output: Result buffer with query's shape and dtype.
         scale: QK softmax scale; bias is added after scaling.
+        query_start_loc: Cumulative request boundaries [requests + 1] on the
+            query device; None means one contiguous sequence.
+        max_query_len: Longest request in the packed inputs; required with
+            query_start_loc. Taken from CPU scheduling metadata without GPU reads.
         tile: Optional (query_rows, key_rows, warps, stages) for kernel tuning.
             Ordinary calls use a shape-based launch policy.
 
@@ -144,32 +165,47 @@ def token_gate_prefill(
 
     """
     length, heads, size = query.shape
+    packed = query_start_loc is not None
+    if query_start_loc is not None:
+        if max_query_len is None or max_query_len < 1:
+            raise ValueError("Packed prefill requires a positive max_query_len")
+        requests = query_start_loc.numel() - 1
+        if key_bias.ndim != 3 or key_bias.shape[0] != requests:
+            raise ValueError("Packed key_bias must have one row per request")
+        bias_stride_seq = key_bias.stride(0)
+    else:
+        requests, max_query_len, bias_stride_seq = 1, length, 0
+        if key_bias.ndim != 2:
+            raise ValueError("Single-sequence key_bias must be two-dimensional")
     if tile is None:
         # One pipeline stage leaves room for wider key tiles with large heads.
         tile = (
             (64, 64, 4, 1)
             if size > 128
-            else ((128, 64, 4, 2) if length >= 16384 else (64, 64, 4, 2))
+            else ((128, 64, 4, 2) if max_query_len >= 16384 else (64, 64, 4, 2))
         )
     block_m, block_n, warps, stages = tile
-    _token_gate_prefill[(triton.cdiv(length, block_m), heads)](
+    _token_gate_prefill[(triton.cdiv(max_query_len, block_m), heads, requests)](
         query,
         key,
         value,
         key_bias,
         output,
+        query_start_loc,
         query.stride(0),
         query.stride(1),
         key.stride(0),
         key.stride(1),
         value.stride(0),
         value.stride(1),
-        key_bias.stride(0),
-        key_bias.stride(1),
+        key_bias.stride(-2),
+        key_bias.stride(-1),
+        bias_stride_seq,
         output.stride(0),
         output.stride(1),
         length,
-        key_bias.shape[0],
+        key_bias.shape[-2],
+        packed,
         heads // key.shape[1],
         scale,
         size,
